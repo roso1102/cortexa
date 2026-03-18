@@ -79,6 +79,9 @@ class MemoryManager:
         matches: List[Dict[str, Any]] = []
         for match in res.get("matches", []):
             md = match.get("metadata") or {}
+            # Preserve the Pinecone vector id for downstream updates/deletes
+            if match.get("id"):
+                md["id"] = match.get("id")
             md["score"] = match.get("score")
             matches.append(md)
         return matches
@@ -90,6 +93,8 @@ class MemoryManager:
         now_ts = utc_now_ts()
         for match in res.get("matches", []):
             md = match.get("metadata") or {}
+            if match.get("id"):
+                md["id"] = match.get("id")
             md["score"] = match.get("score")
             matches.append(md)
             # Update last_accessed_ts in the background — best effort, non-blocking
@@ -106,6 +111,45 @@ class MemoryManager:
                 except Exception:
                     pass  # access tracking is best-effort
         return matches
+
+    def soft_archive_low_priority(
+        self,
+        *,
+        priority_threshold: float = 0.15,
+        inactive_days: int = 90,
+        k: int = 200,
+    ) -> int:
+        """
+        Soft-archive low-priority memories that haven't been accessed recently.
+        Returns number of memories archived (best-effort).
+        """
+        cutoff_ts = utc_now_ts() - (inactive_days * 86400)
+        matches = self.query_by_filter(
+            query_text="archive old low priority memories",
+            filter_obj={
+                "priority_score": {"$lte": priority_threshold},
+                "last_accessed_ts": {"$lte": cutoff_ts},
+                "source_type": {"$nin": ["reminder", "diary_entry", "tunnel", "profile_snapshot"]},
+                "archived": {"$ne": True},
+            },
+            k=k,
+        )
+
+        archived = 0
+        now_ts = utc_now_ts()
+        for md in matches:
+            mem_id = str(md.get("id") or "").strip()
+            if not mem_id:
+                continue
+            try:
+                self.update_memory_metadata(
+                    mem_id,
+                    {"archived": True, "archived_at_ts": now_ts},
+                )
+                archived += 1
+            except Exception:
+                continue
+        return archived
 
     def get_old_memories(self, older_than_ts: int, exclude_source_types: List[str] | None = None, k: int = 100) -> List[Dict[str, Any]]:
         """Return memories created before older_than_ts, optionally excluding certain source types."""

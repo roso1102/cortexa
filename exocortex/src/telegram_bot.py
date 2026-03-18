@@ -189,6 +189,51 @@ class CortexaBot:
         summary = self._reflection.summarize_today()
         await self._send_text(context, update.effective_chat.id, summary)
 
+    async def handle_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
+        if not update.effective_chat:
+            return
+        chat_id = update.effective_chat.id
+        # Prefer latest stored snapshot; generate if missing
+        profile = self._get_latest_profile()
+        if not profile:
+            profile = self._reflection.generate_profile_snapshot()
+        await self._send_text(context, chat_id, f"Your profile snapshot:\n\n{profile}")
+
+    async def handle_tunnels(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
+        if not update.effective_chat:
+            return
+        chat_id = update.effective_chat.id
+        matches = self._memory.query_by_filter(
+            query_text="tunnels themes clusters",
+            filter_obj={"source_type": {"$eq": "tunnel"}},
+            k=30,
+        )
+        if not matches:
+            await self._send_text(context, chat_id, "No tunnels yet. Once you’ve saved more memories, I’ll start forming themes automatically.")
+            return
+
+        # Deduplicate by tunnel_id/name
+        seen: set[str] = set()
+        lines = ["Your tunnels:"]
+        for m in matches:
+            tid = str(m.get("id") or m.get("tunnel_id") or "").strip()
+            name = str(m.get("tunnel_name") or "").strip() or "Untitled Tunnel"
+            if tid and tid in seen:
+                continue
+            if tid:
+                seen.add(tid)
+            count = m.get("memory_count")
+            core_tag = m.get("core_tag")
+            extra = []
+            if count is not None:
+                extra.append(f"{count} memories")
+            if core_tag:
+                extra.append(f"core: {core_tag}")
+            suffix = f" ({', '.join(extra)})" if extra else ""
+            lines.append(f"- {name}{suffix}")
+
+        await self._send_text(context, chat_id, "\n".join(lines))
+
     async def handle_feedback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
         """Handle inline button feedback on resurfaced memory items."""
         query = update.callback_query
@@ -545,6 +590,8 @@ def run_bot(config: AppConfig) -> None:
 
     app.add_handler(CommandHandler("start", bot.handle_start))
     app.add_handler(CommandHandler("summary_today", bot.handle_summary_today))
+    app.add_handler(CommandHandler("profile", bot.handle_profile))
+    app.add_handler(CommandHandler("tunnels", bot.handle_tunnels))
     app.add_handler(CallbackQueryHandler(bot.handle_feedback, pattern=r"^fb:"))
     app.add_handler(MessageHandler(filters.Document.ALL, bot.handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_text))

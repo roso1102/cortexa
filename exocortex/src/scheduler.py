@@ -324,6 +324,15 @@ class ReminderScheduler:
                     self._owner_chat_id,
                     f"Weekly tunnels updated. Found {len(tunnels)} theme(s): {names}",
                 )
+
+            # After tunnels, run pruning/decay v1 (soft-archive low-priority stale items)
+            try:
+                archived = self._memory.soft_archive_low_priority(priority_threshold=0.15, inactive_days=90)
+                if archived:
+                    self._send_telegram(self._owner_chat_id, f"Weekly cleanup: archived {archived} low-priority old item(s).")
+            except Exception:
+                logger.exception("Weekly pruning failed")
+
             self._tunnel_sent_week = week_str
             logger.info("Tunnel formation completed for week %s: %d tunnels", week_str, len(tunnels))
         except Exception:
