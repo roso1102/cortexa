@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Dict
 
 from groq import Groq
@@ -15,6 +16,7 @@ INTENT_QUERY       = "QUERY"
 INTENT_REMINDER    = "REMINDER"
 INTENT_LIST_LINKS  = "LIST_LINKS"
 INTENT_DELETE      = "DELETE"
+INTENT_CHITCHAT    = "CHITCHAT"
 INTENT_UNKNOWN     = "UNKNOWN"
 
 _CLASSIFICATION_SCHEMA = """\
@@ -62,23 +64,45 @@ Key rule: If a message mentions a person AND a time word (this evening, tonight,
 """
 
 
+# Salutations / small-talk phrases — should get a friendly reply, not be saved
+_CHITCHAT_PHRASES = frozenset({
+    "hi", "hello", "hey", "heyy", "heya",
+    "bye", "goodbye", "good bye", "cya", "see ya", "see you",
+    "good night", "goodnight", "gn", "gn!",
+    "good morning", "gm", "good afternoon", "good evening",
+    "how are you", "how r u", "how are u", "how's it going",
+    "whats up", "what's up", "wassup", "sup",
+    "thanks", "thank you", "ty", "thx",
+    "ok", "okay", "k", "kk", "cool", "nice", "great", "perfect",
+    "lol", "haha", "hehe", "lmao",
+    "yes", "no", "yeah", "nah", "yep", "nope",
+})
+
 _QUERY_PREFIXES = (
     "what ", "what's ", "whats ", "wht ", "wat ",
     "how ", "how's ",
     "why ", "when ", "where ", "who ",
-    "tell me", "show me", "give me",
+    "tell me", "give me",
     "recall ", "remember ", "do you know",
     "analyze ", "analyse ", "plan ", "compare ", "summarize ", "summarise ",
     "explain ", "propose ", "suggest ", "list my ", "find my ",
 )
 
+# "show me" only qualifies as a query if it's NOT a list-links request
+_LIST_LINK_CUES = (
+    "links", "urls", "saved links", "link i saved", "links i saved",
+    "links saved today", "link saved today",
+)
+
 _QUERY_SUBSTRINGS = (
     "did i save", "did i note", "i saved about", "i know about",
-    "what about", "can you tell", "can you show",
+    "what about", "can you tell",
     "step plan", "validation plan", "give me a plan",
 )
 
-# Time-of-day / relative-time cues that make a message an implicit reminder
+# Time-of-day / relative-time cues that make a message an implicit reminder.
+# "am" / "pm" are matched only when preceded by a digit (e.g. "9am", "10pm")
+# to avoid false positives like "i am a llama".
 _REMINDER_TIME_CUES = (
     "this evening", "this morning", "this afternoon", "tonight",
     "tomorrow", "next week", "next monday", "next tuesday", "next wednesday",
@@ -87,14 +111,36 @@ _REMINDER_TIME_CUES = (
     "in 1 minute", "in 5 minutes", "in 10 minutes", "in 15 minutes",
     "in 30 minutes", "in 45 minutes",
     " at 6", " at 7", " at 8", " at 9", " at 10", " at 11", " at 12",
-    "pm", "am",
 )
+
+
+_AM_PM_RE = re.compile(r"\d\s*[ap]m\b")
+
+
+def _is_chitchat(text: str) -> bool:
+    """Return True if the message is a greeting or social pleasantry."""
+    t = text.strip().lower().rstrip("!.,?")
+    return t in _CHITCHAT_PHRASES
+
+
+def _is_list_links_query(text: str) -> bool:
+    """Return True if the message is clearly asking to list saved links."""
+    t = text.strip().lower()
+    return any(cue in t for cue in _LIST_LINK_CUES)
 
 
 def _is_obvious_query(text: str) -> bool:
     """Fast pre-check: return True if the message is unambiguously a query."""
     t = text.strip().lower()
+
+    # List-links requests should not be short-circuited to QUERY
+    if _is_list_links_query(t):
+        return False
+
     if t.endswith("?"):
+        return True
+    # "show me" without link context is a query
+    if t.startswith("show me") and not _is_list_links_query(t):
         return True
     if any(t.startswith(p) for p in _QUERY_PREFIXES):
         return True
@@ -107,13 +153,21 @@ def _is_implicit_reminder(text: str) -> bool:
     """
     Detect messages like "call mom this evening" or "dentist at 6pm" that
     are implicit reminders (no 'remind me' prefix but contain a time cue).
+
+    "am" / "pm" only count when preceded by a digit (e.g. "9am", "10pm") to
+    avoid false positives like "i am a llama".
     """
     t = text.strip().lower()
-    # Explicit "remind me" is handled by REMINDER intent already
+    # Explicit "remind me" is already handled by the LLM path
     if "remind me" in t:
         return False
-    # Must contain a time cue to be treated as an implicit reminder
-    return any(cue in t for cue in _REMINDER_TIME_CUES)
+    # Check phrase-based cues (evening, tonight, tomorrow, etc.)
+    if any(cue in t for cue in _REMINDER_TIME_CUES):
+        return True
+    # Check digit+am/pm patterns (e.g. "9am", "6 pm", "10pm")
+    if _AM_PM_RE.search(t):
+        return True
+    return False
 
 
 def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
@@ -121,6 +175,15 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
     Use Groq to classify the user's intent into a structured action.
     Falls back to keyword heuristic if LLM call fails.
     """
+    # Fast-path: greetings / pleasantries — reply warmly, don't save
+    if _is_chitchat(text):
+        return {
+            "intent": INTENT_CHITCHAT,
+            "confidence": 1.0,
+            "summary": "pre-check: greeting or social pleasantry",
+            "source": "pre-check",
+        }
+
     # Fast-path: obvious queries skip the LLM entirely
     if _is_obvious_query(text):
         return {
@@ -160,6 +223,7 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
             INTENT_REMINDER,
             INTENT_LIST_LINKS,
             INTENT_DELETE,
+            INTENT_CHITCHAT,
             INTENT_UNKNOWN,
         }:
             intent = INTENT_UNKNOWN

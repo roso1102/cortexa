@@ -10,6 +10,7 @@ import fitz  # PyMuPDF
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -20,7 +21,7 @@ from src.config import AppConfig
 from src.brains import BrainsRouter
 from src.memory import MemoryManager
 from src.reflection import ReflectionService
-from src.orchestrator import classify_intent, INTENT_QUERY, INTENT_INGEST_TEXT, INTENT_INGEST_LINK, INTENT_REMINDER, INTENT_LIST_LINKS, INTENT_DELETE
+from src.orchestrator import classify_intent, INTENT_QUERY, INTENT_INGEST_TEXT, INTENT_INGEST_LINK, INTENT_REMINDER, INTENT_LIST_LINKS, INTENT_DELETE, INTENT_CHITCHAT
 from datetime import datetime, timedelta, timezone
 
 from src.utils import chunk_text, utc_now_iso, utc_now_ts
@@ -60,11 +61,16 @@ class CortexaBot:
             for phrase in (
                 "what links did i save",
                 "which links did i save",
-                "links did i save today",
-                "links i saved today",
-                "show links saved today",
-                "show me links saved today",
-                "list links saved today",
+                "links did i save",
+                "links i saved",
+                "show links",
+                "show me links",
+                "show me my links",
+                "show me saved links",
+                "show me my saved links",
+                "list links",
+                "my saved links",
+                "saved links",
             )
         )
 
@@ -183,6 +189,57 @@ class CortexaBot:
         summary = self._reflection.summarize_today()
         await self._send_text(context, update.effective_chat.id, summary)
 
+    async def handle_feedback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
+        """Handle inline button feedback on resurfaced memory items."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        await query.answer()  # acknowledge immediately so spinner stops
+
+        data = query.data  # format: "fb:action:memory_id"
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[0] != "fb":
+            return
+
+        _, action, memory_id = parts
+        now_ts = utc_now_ts()
+
+        try:
+            if action == "relevant":
+                # Boost priority score (cap at 1.0)
+                self._memory.update_memory_metadata(memory_id, {
+                    "priority_score": min(1.0, 0.7),  # bump to 0.7
+                    "last_feedback_ts": now_ts,
+                    "feedback": "relevant",
+                })
+                await query.edit_message_reply_markup(reply_markup=None)
+                await query.message.reply_text("Marked as still relevant. I'll keep it on your radar.")  # type: ignore[union-attr]
+
+            elif action == "irrelevant":
+                # Reduce priority score (floor at 0.0)
+                self._memory.update_memory_metadata(memory_id, {
+                    "priority_score": 0.1,
+                    "last_feedback_ts": now_ts,
+                    "feedback": "irrelevant",
+                    "last_resurfaced_ts": now_ts + (30 * 86400),  # suppress for 30 days
+                })
+                await query.edit_message_reply_markup(reply_markup=None)
+                await query.message.reply_text("Got it. I'll stop surfacing that one.")  # type: ignore[union-attr]
+
+            elif action == "snooze":
+                snooze_until = now_ts + (7 * 86400)
+                self._memory.update_memory_metadata(memory_id, {
+                    "last_resurfaced_ts": snooze_until,
+                    "last_feedback_ts": now_ts,
+                    "feedback": "snoozed",
+                })
+                await query.edit_message_reply_markup(reply_markup=None)
+                await query.message.reply_text("Snoozed for 7 days. I'll bring it back then.")  # type: ignore[union-attr]
+
+        except Exception as exc:
+            logger.exception("Feedback handler error: %s", exc)
+            await query.message.reply_text("Something went wrong updating that memory.")  # type: ignore[union-attr]
+
     def _store_confirmation(self, text: str) -> str:
         """Return a warm, human-feeling confirmation line for a stored note."""
         snippet = text.strip()[:60].rstrip(".,;:!?")
@@ -195,6 +252,20 @@ class CortexaBot:
         if not self._config.allowed_chat_ids:
             return True  # open/single-user mode
         return chat_id in self._config.allowed_chat_ids
+
+    def _get_latest_profile(self) -> str | None:
+        """Fetch the most recent profile_snapshot from memory to personalise query answers."""
+        try:
+            matches = self._memory.query_by_filter(
+                query_text="personal profile interests tunnels topics",
+                filter_obj={"source_type": {"$eq": "profile_snapshot"}},
+                k=1,
+            )
+            if matches:
+                return str(matches[0].get("raw_content") or "")[:600]
+        except Exception:
+            pass
+        return None
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
         if not update.effective_chat or not update.message or not update.message.text:
@@ -218,6 +289,26 @@ class CortexaBot:
                 f"[debug] intent={intent} confidence={intent_result.get('confidence', '?'):.2f} "
                 f"source={intent_result.get('source', '?')} reason={intent_result.get('summary', '')}",
             )
+
+        # --- CHITCHAT: greeting / pleasantry — reply warmly, do NOT save ---
+        if intent == INTENT_CHITCHAT:
+            replies = {
+                frozenset({"hi", "hello", "hey", "heyy", "heya"}): "Hey! What's on your mind? You can share a note, ask me something, or drop a link.",
+                frozenset({"bye", "goodbye", "good bye", "cya", "see ya", "see you"}): "See you! I'll keep your memories safe until you're back.",
+                frozenset({"good night", "goodnight", "gn", "gn!"}): "Good night! Rest well. I'll be here when you need me.",
+                frozenset({"good morning", "gm"}): "Good morning! Ready to capture something new today?",
+                frozenset({"good afternoon", "good evening"}): "Hello! What are you working on?",
+                frozenset({"thanks", "thank you", "ty", "thx"}): "Happy to help! Anything else on your mind?",
+                frozenset({"how are you", "how r u", "how are u", "how's it going", "whats up", "what's up", "wassup", "sup"}): "Doing great, ready to help! What would you like to save or recall?",
+            }
+            t_lower = text.strip().lower().rstrip("!.,?")
+            reply = "Got it!"
+            for phrase_set, response in replies.items():
+                if t_lower in phrase_set:
+                    reply = response
+                    break
+            await self._send_text(context, chat_id, reply)
+            return
 
         # --- LIST_LINKS: structured metadata query, no semantic search ---
         if intent == INTENT_LIST_LINKS or self._is_links_list_query(text):
@@ -291,6 +382,7 @@ class CortexaBot:
                                 "created_at": utc_now_iso(),
                                 "created_at_ts": utc_now_ts(),
                                 "tags": link_tags,
+                                "priority_score": 0.5,
                             }
                             self._memory.add_memory(chunk, link_meta)
 
@@ -313,7 +405,8 @@ class CortexaBot:
         # --- QUERY ---
         if intent == INTENT_QUERY:
             contexts = self._memory.recall_context(text, k=5)
-            result = self._brains.route_query(text, contexts)
+            profile_context = self._get_latest_profile()
+            result = self._brains.route_query(text, contexts, profile_context=profile_context)
             await self._send_text(context, chat_id, result["answer"])
             if self._debug_mode:
                 await self._send_text(
@@ -331,6 +424,7 @@ class CortexaBot:
             "created_at": utc_now_iso(),
             "created_at_ts": utc_now_ts(),
             "tags": tags,
+            "priority_score": 0.5,
         }
         self._memory.add_memory(text, metadata)
         await self._send_text(context, chat_id, self._store_confirmation(text))
@@ -408,6 +502,7 @@ class CortexaBot:
                     "created_at": utc_now_iso(),
                     "created_at_ts": utc_now_ts(),
                     "tags": pdf_tags,
+                    "priority_score": 0.5,
                 }
                 self._memory.add_memory(chunk, pdf_meta)
 
@@ -450,6 +545,7 @@ def run_bot(config: AppConfig) -> None:
 
     app.add_handler(CommandHandler("start", bot.handle_start))
     app.add_handler(CommandHandler("summary_today", bot.handle_summary_today))
+    app.add_handler(CallbackQueryHandler(bot.handle_feedback, pattern=r"^fb:"))
     app.add_handler(MessageHandler(filters.Document.ALL, bot.handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_text))
 
@@ -459,6 +555,7 @@ def run_bot(config: AppConfig) -> None:
             reflection=bot._reflection,
             application=app,
             owner_chat_id=config.owner_chat_id,
+            groq_client=bot._groq_client,
             daily_digest_time=config.daily_digest_time,
         )
         scheduler.start()

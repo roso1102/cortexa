@@ -72,6 +72,7 @@ class BrainsRouter:
         query: str,
         context_memories: List[Dict[str, Any]],
         mode_hint: Optional[Literal["fast", "deep"]] = None,
+        profile_context: Optional[str] = None,
     ) -> Dict[str, Any]:
         # Keep context tight to reduce token usage and rambling answers.
         context_chunks = []
@@ -91,6 +92,11 @@ class BrainsRouter:
                 seen_urls.add(url)
                 label = title if title and title != url else url
                 source_refs.append(f"- {label}: {url}")
+
+        # Prepend profile context as an extra memory chunk when available
+        if profile_context:
+            profile_chunk = f"[Personal Profile]\n{profile_context}"
+            context_chunks = [profile_chunk] + context_chunks
 
         messages = _build_messages(self._system_prompt, context_chunks, query, source_refs if source_refs else None)
 

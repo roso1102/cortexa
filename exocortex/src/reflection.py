@@ -182,6 +182,122 @@ class ReflectionService:
 
         return diary_text
 
+    def generate_profile_snapshot(self) -> str:
+        """
+        Monthly personal profile: top tunnels, dominant topics, time-of-day patterns,
+        and oldest vs newest interests.
+        Stored as source_type=profile_snapshot and returned as a string.
+        """
+        now = datetime.now(timezone.utc)
+        month_start_ts = int((now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)).timestamp())
+
+        try:
+            all_memories = self._memory.fetch_all_memories(
+                exclude_source_types=["reminder", "diary_entry", "profile_snapshot"],
+                k=200,
+            )
+        except Exception:
+            return "(Profile generation failed: could not fetch memories.)"
+
+        if not all_memories:
+            return "Not enough memories to build a profile yet."
+
+        tag_counter: Counter = Counter()
+        tunnel_counter: Counter = Counter()
+        hour_counter: Counter = Counter()
+        oldest_ts = float("inf")
+        newest_ts = 0.0
+
+        for m in all_memories:
+            for tag in (m.get("tags") or []):
+                tag_counter[str(tag)] += 1
+            tunnel_name = m.get("tunnel_name")
+            if tunnel_name:
+                tunnel_counter[str(tunnel_name)] += 1
+            created_ts = float(m.get("created_at_ts") or 0)
+            if created_ts:
+                oldest_ts = min(oldest_ts, created_ts)
+                newest_ts = max(newest_ts, created_ts)
+                hour = datetime.fromtimestamp(created_ts, tz=timezone.utc).hour
+                hour_counter[hour] += 1
+
+        # Top topics
+        top_tags = tag_counter.most_common(6)
+        tag_line = ", ".join(f"{tag} ({cnt})" for tag, cnt in top_tags) if top_tags else "none yet"
+
+        # Top tunnels
+        top_tunnels = tunnel_counter.most_common(4)
+        tunnel_line = ", ".join(f'"{t}"' for t, _ in top_tunnels) if top_tunnels else "no tunnels formed yet"
+
+        # Time-of-day pattern
+        if hour_counter:
+            peak_hour = hour_counter.most_common(1)[0][0]
+            if 5 <= peak_hour < 12:
+                time_pattern = f"morning person (peak ~{peak_hour}:00 UTC)"
+            elif 12 <= peak_hour < 17:
+                time_pattern = f"afternoon thinker (peak ~{peak_hour}:00 UTC)"
+            else:
+                time_pattern = f"evening/night thinker (peak ~{peak_hour}:00 UTC)"
+        else:
+            time_pattern = "unknown"
+
+        oldest_label = (
+            datetime.fromtimestamp(oldest_ts, tz=timezone.utc).strftime("%b %Y")
+            if oldest_ts != float("inf") else "N/A"
+        )
+        newest_label = (
+            datetime.fromtimestamp(newest_ts, tz=timezone.utc).strftime("%b %Y")
+            if newest_ts else "N/A"
+        )
+
+        profile_header = (
+            f"Memory span: {oldest_label} → {newest_label}\n"
+            f"Total memories: {len(all_memories)}\n"
+            f"Active tunnels: {tunnel_line}\n"
+            f"Top topics: {tag_line}\n"
+            f"Capture pattern: {time_pattern}"
+        )
+
+        # LLM narrative
+        context_snippets = "\n".join(
+            f"- {str(m.get('raw_content', ''))[:150]}" for m in all_memories[:20]
+        )
+        prompt = (
+            "You are Exocortex, writing a monthly personal profile for the user.\n\n"
+            f"Profile data:\n{profile_header}\n\n"
+            f"Sample memories:\n{context_snippets}\n\n"
+            "Write a concise 3-4 sentence profile that tells the user who they are intellectually — "
+            "what they care about, how they think, and what's evolving in their interests. "
+            "Write directly to the user using 'you' and 'your'. Be specific and warm."
+        )
+        try:
+            chat = self._groq.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                temperature=0.4,
+            )
+            narrative = chat.choices[0].message.content or ""
+        except Exception:
+            narrative = "(LLM narrative unavailable)"
+
+        full_profile = f"{profile_header}\n\n{narrative}"
+
+        # Store as profile_snapshot
+        try:
+            self._memory.add_memory(full_profile, {
+                "source_type": "profile_snapshot",
+                "period": "monthly",
+                "month": now.strftime("%Y-%m"),
+                "created_at": utc_now_iso(),
+                "created_at_ts": utc_now_ts(),
+                "tags": ["profile", "monthly_snapshot"],
+            })
+        except Exception:
+            pass
+
+        return full_profile
+
     def _get_upcoming_reminders(self, now: datetime) -> List[str]:
         """Return reminder texts due within the next 24 hours."""
         now_ts = int(now.timestamp())

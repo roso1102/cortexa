@@ -114,5 +114,19 @@ class MemoryManager:
             filter_obj["source_type"] = {"$nin": exclude_source_types}
         return self.query_by_filter("memory knowledge idea note", filter_obj, k=k)
 
+    def update_memory_metadata(self, memory_id: str, updates: Dict[str, Any]) -> None:
+        """
+        Update specific metadata fields on an existing memory without re-embedding.
+        Uses Pinecone's update() which accepts set_metadata for partial updates.
+        """
+        self._index.update(id=memory_id, set_metadata=updates)
+
+    def fetch_all_memories(self, exclude_source_types: List[str] | None = None, k: int = 200) -> List[Dict[str, Any]]:
+        """Fetch a broad sample of memories for clustering / profile generation."""
+        filter_obj: Dict[str, Any] = {}
+        if exclude_source_types:
+            filter_obj["source_type"] = {"$nin": exclude_source_types}
+        return self.query_by_filter("knowledge ideas notes memories thoughts", filter_obj, k=k)
+
     def delete_memory(self, memory_id: str) -> None:
         self._index.delete(ids=[memory_id])
