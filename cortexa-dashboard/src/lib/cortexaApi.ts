@@ -37,8 +37,18 @@ async function apiFetch<T>(path: string): Promise<T> {
   });
 
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`API ${path} failed (${res.status}): ${text}`);
+    // Try to parse JSON error first, fall back to text
+    let detail = "";
+    const ct = res.headers.get("content-type") || "";
+    if (ct.includes("application/json")) {
+      const j = await res.json().catch(() => ({}));
+      detail = j.error || JSON.stringify(j);
+    } else {
+      const t = await res.text().catch(() => "");
+      // Strip HTML tags from Flask error pages
+      detail = t.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+    }
+    throw new Error(`API ${path} → ${res.status}: ${detail}`);
   }
 
   return (await res.json()) as T;

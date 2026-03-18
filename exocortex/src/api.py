@@ -29,7 +29,7 @@ def create_api_blueprint(*, memory: MemoryManager, reflection: ReflectionService
         return None
 
     @bp.get("/memories")
-    def get_memories() -> Any:
+    def get_memories() -> Any:  # noqa: C901
         """
         Query params:
           - q: semantic query text (optional)
@@ -83,26 +83,35 @@ def create_api_blueprint(*, memory: MemoryManager, reflection: ReflectionService
 
     @bp.get("/tunnels")
     def get_tunnels() -> Any:
-        tunnels = memory.query_by_filter(
-            query_text="tunnels themes clusters",
-            filter_obj={"source_type": {"$eq": "tunnel"}},
-            k=30,
-        )
+        try:
+            tunnels = memory.query_by_filter(
+                query_text="tunnels themes clusters",
+                filter_obj={"source_type": {"$eq": "tunnel"}},
+                k=30,
+            )
+        except Exception as exc:
+            return jsonify({"error": str(exc), "tunnels": []}), 500
         return jsonify({"tunnels": tunnels})
 
     @bp.get("/profile")
     def get_profile() -> Any:
-        matches = memory.query_by_filter(
-            query_text="profile snapshot",
-            filter_obj={"source_type": {"$eq": "profile_snapshot"}},
-            k=1,
-        )
-        snapshot = matches[0].get("raw_content") if matches else ""
+        try:
+            matches = memory.query_by_filter(
+                query_text="profile snapshot",
+                filter_obj={"source_type": {"$eq": "profile_snapshot"}},
+                k=1,
+            )
+            snapshot = matches[0].get("raw_content") if matches else ""
+        except Exception as exc:
+            return jsonify({"error": str(exc), "snapshot": ""}), 500
         return jsonify({"snapshot": snapshot})
 
     @bp.get("/summary/today")
     def get_summary_today() -> Any:
-        text = reflection.summarize_today()
+        try:
+            text = reflection.summarize_today()
+        except Exception as exc:
+            return jsonify({"error": str(exc), "text": ""}), 500
         return jsonify(
             {
                 "text": text,
