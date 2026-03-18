@@ -1,13 +1,29 @@
 from __future__ import annotations
 
+import logging
 import os
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional
 
 import google.generativeai as genai
 from pinecone import Pinecone, ServerlessSpec
 
 from src.config import AppConfig
 from src.utils import utc_now_iso, utc_now_ts
+
+logger = logging.getLogger(__name__)
+
+# Simple in-process LRU-style embedding cache.
+# Stores up to _EMBED_CACHE_SIZE distinct texts. Avoids re-embedding the same
+# repeated query strings (e.g. "reminder" called every 10 s by the scheduler).
+_EMBED_CACHE_SIZE = 128
+_embed_cache: Dict[str, List[float]] = {}
+_embed_cache_order: List[str] = []
+
+# Back-off state: when a 429 quota error is hit, stop embedding for this many
+# seconds so we don't burn the remaining daily quota in a tight retry loop.
+_QUOTA_BACKOFF_SECS = 120
+_quota_backoff_until: float = 0.0
 
 
 class MemoryManager:
@@ -37,15 +53,47 @@ class MemoryManager:
         self._index = pc.Index(self._index_name)
 
     def _embed(self, text: str) -> List[float]:
-        result = genai.embed_content(
-            model="models/gemini-embedding-001",
-            content=text,
-        )
-        embedding = result["embedding"]  # type: ignore[assignment]
-        # Guardrail: Pinecone index dimension must match embedding length
+        global _quota_backoff_until
+
+        # Return cached vector if available
+        if text in _embed_cache:
+            return _embed_cache[text]
+
+        # Honour quota back-off: if we recently hit 429, skip embedding for now
+        if time.monotonic() < _quota_backoff_until:
+            remaining = int(_quota_backoff_until - time.monotonic())
+            raise RuntimeError(
+                f"Gemini embedding quota back-off active ({remaining}s remaining). "
+                "Skipping embed to avoid burning daily quota."
+            )
+
+        try:
+            result = genai.embed_content(
+                model="models/gemini-embedding-001",
+                content=text,
+            )
+        except Exception as exc:
+            exc_str = str(exc)
+            if "ResourceExhausted" in exc_str or "429" in exc_str or "quota" in exc_str.lower():
+                _quota_backoff_until = time.monotonic() + _QUOTA_BACKOFF_SECS
+                logger.warning(
+                    "Gemini embedding quota hit (429). Back-off for %ds.", _QUOTA_BACKOFF_SECS
+                )
+            raise
+
+        embedding: List[float] = result["embedding"]  # type: ignore[assignment]
         if len(embedding) != 3072:
             raise ValueError(f"Unexpected embedding size: {len(embedding)} (expected 3072)")
-        return embedding  # type: ignore[return-value]
+
+        # Store in cache; evict oldest entry when full
+        if text not in _embed_cache:
+            if len(_embed_cache_order) >= _EMBED_CACHE_SIZE:
+                oldest = _embed_cache_order.pop(0)
+                _embed_cache.pop(oldest, None)
+            _embed_cache[text] = embedding
+            _embed_cache_order.append(text)
+
+        return embedding
 
     def add_memory(self, text: str, metadata: Dict[str, Any]) -> str:
         vector = self._embed(text)
