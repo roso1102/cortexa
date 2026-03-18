@@ -6,7 +6,10 @@ load_dotenv()  # load .env before anything else reads env vars
 from flask import Flask
 
 from src.config import load_config, ConfigError
+from src.memory import MemoryManager
+from src.reflection import ReflectionService
 from src.telegram_bot import run_bot
+from src.api import create_api_blueprint
 
 
 app = Flask(__name__)
@@ -26,6 +29,17 @@ def main() -> None:
         config = load_config()
     except ConfigError as exc:
         raise SystemExit(str(exc)) from exc
+
+    # Optional dashboard API layer (token-protected)
+    if config.dashboard_secret:
+        memory = MemoryManager(config)
+        reflection = ReflectionService(config, memory)
+        api_bp = create_api_blueprint(
+            memory=memory,
+            reflection=reflection,
+            dashboard_secret=config.dashboard_secret,
+        )
+        app.register_blueprint(api_bp)
 
     # Flask runs in a background daemon thread so the main thread is free for the bot
     flask_thread = threading.Thread(target=run_flask, daemon=True)

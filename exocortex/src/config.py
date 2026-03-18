@@ -42,6 +42,8 @@ class AppConfig:
     daily_digest_time: str = ""
     # Owner chat ID for scheduler-initiated messages (reminders, daily digest)
     owner_chat_id: int = 0
+    # Token for dashboard API access (X-Dashboard-Token)
+    dashboard_secret: str = ""
 
 
 def load_config() -> AppConfig:
@@ -69,4 +71,5 @@ def load_config() -> AppConfig:
         allowed_chat_ids=allowed_ids,
         daily_digest_time=os.getenv("DAILY_DIGEST_TIME", "").strip(),
         owner_chat_id=owner_chat_id,
+        dashboard_secret=os.getenv("DASHBOARD_SECRET", "").strip(),
     )
