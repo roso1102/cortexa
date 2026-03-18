@@ -367,7 +367,7 @@ System supports extension toward:
 
 ### 9.1 Forgetting and Pruning
 
-A system that remembers everything becomes noisy. cortexa incorporates a **forgetting mechanism** inspired by synaptic pruning:
+A system that remembers everything becomes noisy. cortexa incorporates a **forgetting mechanism** inspired by synaptic pruning :
 
 * Memories with consistently low activation (rarely accessed, low relevance, negative feedback) decay over time.
 * Very low-activation items can be:
