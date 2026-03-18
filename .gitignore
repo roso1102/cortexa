@@ -52,3 +52,13 @@ htmlcov/
 # Distribution
 *.whl
 *.tar.gz
+
+# Node / Next.js (dashboard)
+**/node_modules/
+**/.next/
+**/.vercel/
+**/out/
+**/.turbo/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
