@@ -30,16 +30,16 @@ def main() -> None:
     except ConfigError as exc:
         raise SystemExit(str(exc)) from exc
 
-    # Optional dashboard API layer (token-protected)
-    if config.dashboard_secret:
-        memory = MemoryManager(config)
-        reflection = ReflectionService(config, memory)
-        api_bp = create_api_blueprint(
-            memory=memory,
-            reflection=reflection,
-            dashboard_secret=config.dashboard_secret,
-        )
-        app.register_blueprint(api_bp)
+    # Dashboard API layer — always registered; auth handled inside the blueprint.
+    # If DASHBOARD_SECRET is not set, every /api/* request returns 401.
+    memory = MemoryManager(config)
+    reflection = ReflectionService(config, memory)
+    api_bp = create_api_blueprint(
+        memory=memory,
+        reflection=reflection,
+        dashboard_secret=config.dashboard_secret,
+    )
+    app.register_blueprint(api_bp)
 
     # Flask runs in a background daemon thread so the main thread is free for the bot
     flask_thread = threading.Thread(target=run_flask, daemon=True)
