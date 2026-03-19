@@ -157,16 +157,31 @@ def _is_implicit_reminder(text: str) -> bool:
     "am" / "pm" only count when preceded by a digit (e.g. "9am", "10pm") to
     avoid false positives like "i am a llama".
     """
-    t = text.strip().lower()
+    raw = text or ""
+    t = raw.strip().lower()
+    # Never treat long or multi-line messages as implicit reminders.
+    # Those are almost always notes/poems/brain-dumps.
+    if "\n" in raw:
+        return False
+    if len(t) > 140:
+        return False
     # Explicit "remind me" is already handled by the LLM path
     if "remind me" in t:
         return False
+    # If the user is clearly asking to save something, it's ingestion, not a reminder.
+    if t.startswith(("save this", "save:", "note this", "note:", "log this", "journal this")):
+        return False
     # Check phrase-based cues (evening, tonight, tomorrow, etc.)
     if any(cue in t for cue in _REMINDER_TIME_CUES):
-        return True
+        # Require an action verb to reduce false positives
+        if any(v in t for v in ("call ", "meet", "meeting", "pay", "submit", "review", "check", "follow up", "message", "text ", "email", "buy ")):
+            return True
+        return False
     # Check digit+am/pm patterns (e.g. "9am", "6 pm", "10pm")
     if _AM_PM_RE.search(t):
-        return True
+        if any(v in t for v in ("call ", "meet", "meeting", "pay", "submit", "review", "check", "follow up", "message", "text ", "email", "buy ")):
+            return True
+        return False
     return False
 
 
@@ -181,6 +196,16 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
             "intent": INTENT_CHITCHAT,
             "confidence": 1.0,
             "summary": "pre-check: greeting or social pleasantry",
+            "source": "pre-check",
+        }
+
+    # Fast-path: explicit "save/note/log" commands are ingestion, not reminders
+    t = (text or "").strip().lower()
+    if t.startswith(("save this", "save:", "note this", "note:", "log this", "journal this")) and "http" not in t:
+        return {
+            "intent": INTENT_INGEST_TEXT,
+            "confidence": 0.9,
+            "summary": "pre-check: explicit save/note instruction",
             "source": "pre-check",
         }
 

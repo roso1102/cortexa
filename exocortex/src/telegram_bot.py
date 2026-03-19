@@ -496,7 +496,31 @@ class CortexaBot:
                             await self._send_text(context, chat_id, f"[debug] link_saved chunks={len(chunks)}")
                     except Exception as exc:  # noqa: BLE001
                         logger.exception("Failed to ingest link: %s", exc)
-                        await self._send_text(context, chat_id, f"Sorry, I ran into a problem fetching that link.\n{url}")
+                        # If extraction fails (403 paywall etc.), still save the URL as a bookmark.
+                        try:
+                            title_guess = text.splitlines()[0].strip()[:120] if text.strip() else url
+                            link_tags = tag_text(title_guess, self._groq_client)
+                            self._memory.add_memory(
+                                f"Title: {title_guess}\nURL: {url}\n\n(Bookmark saved; content fetch failed.)",
+                                {
+                                    "source_type": "link",
+                                    "url": url,
+                                    "title": title_guess,
+                                    "chunk_index": 0,
+                                    "created_at": utc_now_iso(),
+                                    "created_at_ts": utc_now_ts(),
+                                    "tags": link_tags,
+                                    "priority_score": 0.5,
+                                    "fetch_error": str(exc)[:200],
+                                },
+                            )
+                            await self._send_text(
+                                context,
+                                chat_id,
+                                f'I saved the link as a bookmark (the site blocked extraction):\n{url}',
+                            )
+                        except Exception:
+                            await self._send_text(context, chat_id, f"Sorry, I ran into a problem fetching that link.\n{url}")
                         if self._debug_mode:
                             await self._send_text(context, chat_id, f"[debug] link_error type={type(exc).__name__} msg={exc}")
                 return
