@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Dict
+from urllib.parse import unquote
 
 from flask import Blueprint, jsonify, request
 from flask_cors import CORS
@@ -84,7 +85,16 @@ def create_api_blueprint(*, memory: MemoryManager, reflection: ReflectionService
     @bp.get("/memories/<memory_id>")
     def get_memory(memory_id: str) -> Any:
         try:
-            md = memory.get_memory_by_id(memory_id)
+            # Normalize ID: handle once- or twice-encoded timestamp ids
+            prev = memory_id
+            for _ in range(5):
+                decoded = unquote(prev)
+                if decoded == prev:
+                    break
+                prev = decoded
+            normalized_id = prev
+
+            md = memory.get_memory_by_id(normalized_id)
             if not md:
                 return jsonify({"error": "not_found"}), 404
             return jsonify({"item": md})

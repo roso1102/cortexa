@@ -320,11 +320,21 @@ class CortexaBot:
         List recently saved poems and remember their ids for follow-up selection like "show poem 1".
         Poems are detected heuristically via tags containing "poem".
         """
-        matches = self._memory.query_by_filter(
+        # Pinecone metadata filters do not support "$contains" on arrays,
+        # so we fetch a broader slice and filter by tags client-side.
+        candidates = self._memory.query_by_filter(
             query_text="poem verse poetry",
-            filter_obj={"tags": {"$contains": "poem"}},
-            k=10,
+            filter_obj={},
+            k=50,
         )
+
+        matches = []
+        for m in candidates:
+            tags = [str(t).lower() for t in (m.get("tags") or [])]
+            if "poem" in tags:
+                matches.append(m)
+            if len(matches) >= 10:
+                break
 
         if not matches:
             await self._send_text(context, chat_id, "I couldn't find any poems you've saved yet.")
