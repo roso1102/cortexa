@@ -317,46 +317,46 @@ class CortexaBot:
 
     async def _handle_list_poems(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:  # type: ignore[type-arg]
         """
-        List recently saved poems and remember their ids for follow-up selection like \"show poem 1\".
-        Poems are detected heuristically via tags containing \"poem\".
+        List recently saved poems and remember their ids for follow-up selection like "show poem 1".
+        Poems are detected heuristically via tags containing "poem".
         """
         matches = self._memory.query_by_filter(
-            query_text=\"poem verse poetry\",
-            filter_obj={\"tags\": {\"$contains\": \"poem\"}},
+            query_text="poem verse poetry",
+            filter_obj={"tags": {"$contains": "poem"}},
             k=10,
         )
 
         if not matches:
-            await self._send_text(context, chat_id, \"I couldn't find any poems you've saved yet.\")
+            await self._send_text(context, chat_id, "I couldn't find any poems you've saved yet.")
             if self._debug_mode:
-                await self._send_text(context, chat_id, \"[debug] poems_list count=0\")  # type: ignore[arg-type]
+                await self._send_text(context, chat_id, "[debug] poems_list count=0")  # type: ignore[arg-type]
             return
 
         poem_ids: list[str] = []
-        lines: list[str] = [\"You saved these poems:\\n\"]
+        lines: list[str] = ["You saved these poems:\n"]
         for idx, m in enumerate(matches, start=1):
-            mem_id = str(m.get(\"id\") or \"\").strip()
+            mem_id = str(m.get("id") or "").strip()
             if not mem_id:
                 continue
             poem_ids.append(mem_id)
-            raw = str(m.get(\"raw_content\") or \"\").strip()
-            title = str(m.get(\"title\") or \"\").strip()
+            raw = str(m.get("raw_content") or "").strip()
+            title = str(m.get("title") or "").strip()
             if not title:
                 # Fallback: first non-empty line of content
-                first_line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), \"\")
-                title = first_line[:80] or f\"Poem {idx}\"
+                first_line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
+                title = first_line[:80] or f"Poem {idx}"
             dash_url = self._dashboard_memory_url(mem_id)
             if dash_url:
-                lines.append(f\"{idx}. {title}\\n   Open: {dash_url}\")
+                lines.append(f"{idx}. {title}\n   Open: {dash_url}")
             else:
-                lines.append(f\"{idx}. {title}\")
+                lines.append(f"{idx}. {title}")
 
         # Remember list for this chat
-        self._last_lists.setdefault(chat_id, {})[\"poems\"] = poem_ids
+        self._last_lists.setdefault(chat_id, {})["poems"] = poem_ids
 
-        await self._send_text(context, chat_id, \"\\n\".join(lines).strip())
+        await self._send_text(context, chat_id, "\n".join(lines).strip())
         if self._debug_mode:
-            await self._send_text(context, chat_id, f\"[debug] poems_list count={len(poem_ids)}\")  # type: ignore[arg-type]
+            await self._send_text(context, chat_id, f"[debug] poems_list count={len(poem_ids)}")  # type: ignore[arg-type]
 
     def _dashboard_memory_url(self, memory_id: str) -> str | None:
         base = (self._config.dashboard_public_url or "").strip()
