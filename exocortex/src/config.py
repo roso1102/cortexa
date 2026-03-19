@@ -44,6 +44,8 @@ class AppConfig:
     owner_chat_id: int = 0
     # Token for dashboard API access (X-Dashboard-Token)
     dashboard_secret: str = ""
+    # Public base URL for the web dashboard (used to create deep-links in Telegram)
+    dashboard_public_url: str = ""
 
 
 def load_config() -> AppConfig:
@@ -72,4 +74,5 @@ def load_config() -> AppConfig:
         daily_digest_time=os.getenv("DAILY_DIGEST_TIME", "").strip(),
         owner_chat_id=owner_chat_id,
         dashboard_secret=os.getenv("DASHBOARD_SECRET", "").strip(),
+        dashboard_public_url=os.getenv("DASHBOARD_PUBLIC_URL", "").strip(),
     )

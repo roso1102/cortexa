@@ -222,3 +222,17 @@ class MemoryManager:
 
     def delete_memory(self, memory_id: str) -> None:
         self._index.delete(ids=[memory_id])
+
+    def get_memory_by_id(self, memory_id: str) -> Dict[str, Any] | None:
+        """Fetch a single memory by Pinecone vector id (metadata only)."""
+        try:
+            res = self._index.fetch(ids=[memory_id])
+            vectors = res.get("vectors") or {}
+            vec = vectors.get(memory_id) or {}
+            md = vec.get("metadata") or None
+            if md and isinstance(md, dict):
+                md["id"] = memory_id
+                return md
+        except Exception:
+            return None
+        return None

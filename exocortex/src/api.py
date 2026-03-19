@@ -81,6 +81,16 @@ def create_api_blueprint(*, memory: MemoryManager, reflection: ReflectionService
             }
         )
 
+    @bp.get("/memories/<memory_id>")
+    def get_memory(memory_id: str) -> Any:
+        try:
+            md = memory.get_memory_by_id(memory_id)
+            if not md:
+                return jsonify({"error": "not_found"}), 404
+            return jsonify({"item": md})
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
     @bp.get("/tunnels")
     def get_tunnels() -> Any:
         try:

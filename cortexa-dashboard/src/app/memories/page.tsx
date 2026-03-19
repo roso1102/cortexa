@@ -63,7 +63,13 @@ export default async function MemoriesPage({
               <div key={(m.id as string) || `${idx}`} className="p-4">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="rounded-full bg-zinc-100 px-2 py-1 text-xs text-zinc-700">{st}</span>
-                  <div className="text-sm font-medium">{title}</div>
+                  {m.id ? (
+                    <a className="text-sm font-medium text-blue-700 hover:underline" href={`/memories/${m.id as string}`}>
+                      {title}
+                    </a>
+                  ) : (
+                    <div className="text-sm font-medium">{title}</div>
+                  )}
                 </div>
                 {m.url ? (
                   <a className="mt-1 block break-all text-sm text-blue-700 hover:underline" href={m.url as string} target="_blank" rel="noreferrer">

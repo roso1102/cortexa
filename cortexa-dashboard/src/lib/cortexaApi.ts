@@ -83,3 +83,7 @@ export async function getMemories(params?: {
   return apiFetch(`/api/memories${qs ? `?${qs}` : ""}`);
 }
 
+export async function getMemoryById(id: string): Promise<{ item: MemoryItem }> {
+  return apiFetch(`/api/memories/${encodeURIComponent(id)}`);
+}
+

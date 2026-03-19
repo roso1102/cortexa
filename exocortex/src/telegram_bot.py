@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 import fitz  # PyMuPDF
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -312,6 +312,53 @@ class CortexaBot:
             pass
         return None
 
+    def _dashboard_memory_url(self, memory_id: str) -> str | None:
+        base = (self._config.dashboard_public_url or "").strip()
+        if not base:
+            return None
+        base = base.rstrip("/")
+        return f"{base}/memories/{memory_id}"
+
+    def _store_full_and_chunks(self, *, text: str, base_meta: dict[str, Any], chunk_source_type: str) -> str:
+        """
+        Store a canonical full record (entire text) and optional chunk children for retrieval/understanding.
+        Returns the full record's memory_id.
+        """
+        full_id = utc_now_iso()
+        full_meta = {
+            **base_meta,
+            "id": full_id,
+            "is_full": True,
+            "priority_score": float(base_meta.get("priority_score") or 0.5),
+        }
+        self._memory.add_memory(text, full_meta)
+
+        # Store chunks only for long text
+        if len(text) > 900:
+            chunks = chunk_text(text)[:30]
+            for idx, chunk in enumerate(chunks):
+                child_meta = {
+                    **base_meta,
+                    "source_type": chunk_source_type,
+                    "parent_id": full_id,
+                    "chunk_index": idx,
+                    "is_full": False,
+                    "priority_score": float(base_meta.get("priority_score") or 0.5),
+                }
+                self._memory.add_memory(chunk, child_meta)
+
+        return full_id
+
+    def _is_simple_recall_query(self, text: str) -> bool:
+        """
+        Heuristic: user wants to see what they saved, not analysis.
+        We can answer with snippets + links (no LLM call) and optionally dashboard deep-links.
+        """
+        t = (text or "").strip().lower()
+        if any(kw in t for kw in ["analyze", "analysis", "plan", "compare", "summarize", "summarise", "propose", "debug"]):
+            return False
+        return any(p in t for p in ["what did i save", "what i saved", "show me what i saved", "recall what i saved", "what do i know about"])
+
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
         if not update.effective_chat or not update.message or not update.message.text:
             return
@@ -377,7 +424,13 @@ class CortexaBot:
             reminder = parse_reminder_llm(text, self._groq_client)
             if reminder:
                 meta = reminder_to_metadata(reminder, chat_id=chat_id)
-                self._memory.add_memory(reminder.text, meta)
+                # Store canonical full reminder + optional chunks
+                base_meta = {**meta, "source_type": "reminder"}
+                full_id = self._store_full_and_chunks(
+                    text=reminder.text,
+                    base_meta=base_meta,
+                    chunk_source_type="reminder_chunk",
+                )
                 await self._send_text(
                     context,
                     chat_id,
@@ -386,6 +439,7 @@ class CortexaBot:
                 )
                 if self._debug_mode:
                     await self._send_text(context, chat_id, f"[debug] intent=REMINDER due={reminder.due_at_iso}")
+                    await self._send_text(context, chat_id, f"[debug] reminder_full_id={full_id}")
                 return
             # If reminder parsing fails, fall through to INGEST_TEXT
 
@@ -450,9 +504,49 @@ class CortexaBot:
         # --- QUERY ---
         if intent == INTENT_QUERY:
             contexts = self._memory.recall_context(text, k=5)
+            # If user is asking for a simple recall, avoid LLM and return snippets + dashboard links.
+            if self._is_simple_recall_query(text) and contexts:
+                lines = ["Here's what I found in your memory:\n"]
+                for m in contexts[:3]:
+                    raw = str(m.get("raw_content") or "").strip()
+                    mid = str(m.get("id") or "").strip()
+                    # Prefer full records if present (skip chunk children)
+                    if m.get("source_type") in {"text_chunk", "reminder_chunk"}:
+                        continue
+                    if len(raw) <= 420:
+                        lines.append(f"- {raw}")
+                    else:
+                        preview = raw[:220].rstrip(".,;:!?") + "…"
+                        link = self._dashboard_memory_url(mid) if mid else None
+                        if link:
+                            lines.append(f"- {preview}\n  Open: {link}")
+                        else:
+                            lines.append(f"- {preview}")
+
+                await self._send_text(context, chat_id, "\n\n".join(lines).strip())
+                return
+
             profile_context = self._get_latest_profile()
             result = self._brains.route_query(text, contexts, profile_context=profile_context)
-            await self._send_text(context, chat_id, result["answer"])
+
+            answer = str(result.get("answer") or "").strip()
+            # If answer is long, send a short preview + dashboard link to the top matching memory.
+            if contexts:
+                top = contexts[0]
+                top_id = str(top.get("id") or "").strip()
+                dash_url = self._dashboard_memory_url(top_id) if top_id else None
+            else:
+                dash_url = None
+
+            if len(answer) <= 700 or not dash_url:
+                await self._send_text(context, chat_id, answer)
+            else:
+                preview = answer[:520].rstrip(".,;:!?") + "…"
+                keyboard = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Open in dashboard", url=dash_url)]]
+                )
+                await context.bot.send_message(chat_id=chat_id, text=preview, reply_markup=keyboard)
+
             if self._debug_mode:
                 await self._send_text(
                     context,
@@ -471,10 +565,14 @@ class CortexaBot:
             "tags": tags,
             "priority_score": 0.5,
         }
-        self._memory.add_memory(text, metadata)
+        full_id = self._store_full_and_chunks(
+            text=text,
+            base_meta=metadata,
+            chunk_source_type="text_chunk",
+        )
         await self._send_text(context, chat_id, self._store_confirmation(text))
         if self._debug_mode:
-            await self._send_text(context, chat_id, f"[debug] intent=INGEST_TEXT type=text tags={tags}")
+            await self._send_text(context, chat_id, f"[debug] intent=INGEST_TEXT type=text tags={tags} full_id={full_id}")
 
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
         if not update.effective_chat or not update.message or not update.message.document:
