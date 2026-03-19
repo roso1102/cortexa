@@ -42,6 +42,9 @@ class CortexaBot:
         self._reflection = ReflectionService(config, self._memory)
         self._debug_mode = config.debug_mode
         self._groq_client = Groq(api_key=config.groq_api_key)
+        # Ephemeral per-chat listing state (e.g. last poem list for \"show poem 1\")
+        # Structure: { chat_id: { \"poems\": [id1, id2, ...] } }
+        self._last_lists: dict[int, dict[str, list[str]]] = {}
 
     def _classify_intent(self, text: str) -> str:
         """
@@ -312,6 +315,49 @@ class CortexaBot:
             pass
         return None
 
+    async def _handle_list_poems(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:  # type: ignore[type-arg]
+        """
+        List recently saved poems and remember their ids for follow-up selection like \"show poem 1\".
+        Poems are detected heuristically via tags containing \"poem\".
+        """
+        matches = self._memory.query_by_filter(
+            query_text=\"poem verse poetry\",
+            filter_obj={\"tags\": {\"$contains\": \"poem\"}},
+            k=10,
+        )
+
+        if not matches:
+            await self._send_text(context, chat_id, \"I couldn't find any poems you've saved yet.\")
+            if self._debug_mode:
+                await self._send_text(context, chat_id, \"[debug] poems_list count=0\")  # type: ignore[arg-type]
+            return
+
+        poem_ids: list[str] = []
+        lines: list[str] = [\"You saved these poems:\\n\"]
+        for idx, m in enumerate(matches, start=1):
+            mem_id = str(m.get(\"id\") or \"\").strip()
+            if not mem_id:
+                continue
+            poem_ids.append(mem_id)
+            raw = str(m.get(\"raw_content\") or \"\").strip()
+            title = str(m.get(\"title\") or \"\").strip()
+            if not title:
+                # Fallback: first non-empty line of content
+                first_line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), \"\")
+                title = first_line[:80] or f\"Poem {idx}\"
+            dash_url = self._dashboard_memory_url(mem_id)
+            if dash_url:
+                lines.append(f\"{idx}. {title}\\n   Open: {dash_url}\")
+            else:
+                lines.append(f\"{idx}. {title}\")
+
+        # Remember list for this chat
+        self._last_lists.setdefault(chat_id, {})[\"poems\"] = poem_ids
+
+        await self._send_text(context, chat_id, \"\\n\".join(lines).strip())
+        if self._debug_mode:
+            await self._send_text(context, chat_id, f\"[debug] poems_list count={len(poem_ids)}\")  # type: ignore[arg-type]
+
     def _dashboard_memory_url(self, memory_id: str) -> str | None:
         base = (self._config.dashboard_public_url or "").strip()
         if not base:
@@ -382,6 +428,49 @@ class CortexaBot:
                 f"source={intent_result.get('source', '?')} reason={intent_result.get('summary', '')}",
             )
 
+        t_lower = text.strip().lower()
+
+        # --- POEM LISTING: \"what poems did I save\" etc. ---
+        if any(
+            phrase in t_lower
+            for phrase in (
+                "what poems did i save",
+                "list poems",
+                "show my poems",
+            )
+        ):
+            await self._handle_list_poems(context, chat_id)
+            return
+
+        # --- POEM SELECTION: \"show poem N\" / \"open poem N\" ---
+        if t_lower.startswith("show poem") or t_lower.startswith("open poem"):
+            import re as _re
+
+            m = _re.match(r"^(show|open) poem\s+(\d+)", t_lower)
+            poem_ids = self._last_lists.get(chat_id, {}).get("poems") or []
+            if m and poem_ids:
+                idx = int(m.group(2)) - 1
+                if 0 <= idx < len(poem_ids):
+                    mem_id = poem_ids[idx]
+                    md = self._memory.get_memory_by_id(mem_id) or {}
+                    raw = str(md.get("raw_content") or "").strip()
+                    dash_url = self._dashboard_memory_url(mem_id)
+                    if len(raw) <= 900 or not dash_url:
+                        await self._send_text(context, chat_id, raw or "(empty poem)")
+                    else:
+                        preview = raw[:600].rstrip(".,;:!?") + "…"
+                        keyboard = InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("Open in dashboard", url=dash_url)]]
+                        )
+                        await context.bot.send_message(chat_id=chat_id, text=preview, reply_markup=keyboard)
+                    if self._debug_mode:
+                        await self._send_text(
+                            context,
+                            chat_id,
+                            f"[debug] poem_selection index={idx+1} id={mem_id}",
+                        )
+                    return
+
         # --- CHITCHAT: greeting / pleasantry — reply warmly, do NOT save ---
         if intent == INTENT_CHITCHAT:
             replies = {
@@ -407,16 +496,60 @@ class CortexaBot:
             await self._handle_links_today(context, chat_id)
             return
 
-        # --- DELETE: CRUD shortcut ---
+        # --- DELETE: CRUD shortcuts ---
         if intent == INTENT_DELETE or text.lower().startswith("delete "):
-            memory_id = text[len("delete "):].strip() if text.lower().startswith("delete ") else text.strip()
+            t_del = text.strip().lower()
+
+            # delete last → remove most recent memory for this chat
+            if t_del == "delete last":
+                try:
+                    last = self._memory.get_latest_memory_for_chat(chat_id)  # type: ignore[attr-defined]
+                except AttributeError:
+                    last = None
+                if not last:
+                    await self._send_text(context, chat_id, "I couldn't find a recent memory to delete.")
+                    return
+                mem_id = str(last.get("id") or "").strip()
+                title = str(last.get("title") or "").strip() or (str(last.get("raw_content") or "").strip()[:40] + "…")
+                try:
+                    self._memory.delete_memory(mem_id)
+                    await self._send_text(context, chat_id, f'Done. Removed your last memory (id: {mem_id}, title: "{title}").')
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Failed to delete last memory: %s", exc)
+                    await self._send_text(context, chat_id, "Hmm, I couldn't remove your last memory.")
+                return
+
+            # delete poem N → use last poems list state
+            if t_del.startswith("delete poem"):
+                import re as _re
+
+                m = _re.match(r"^delete poem\s+(\d+)", t_del)
+                poem_ids = self._last_lists.get(chat_id, {}).get("poems") or []
+                if m and poem_ids:
+                    idx = int(m.group(1)) - 1
+                    if 0 <= idx < len(poem_ids):
+                        mem_id = poem_ids[idx]
+                        try:
+                            self._memory.delete_memory(mem_id)
+                            await self._send_text(context, chat_id, f"Done. Removed poem {idx+1} (id: {mem_id}).")
+                        except Exception as exc:  # noqa: BLE001
+                            logger.exception("Failed to delete poem memory: %s", exc)
+                            await self._send_text(context, chat_id, "Hmm, I couldn't remove that poem.")
+                        return
+
+            # delete <id> → explicit id
+            if text.lower().startswith("delete "):
+                memory_id = text[len("delete "):].strip()
+            else:
+                memory_id = text.strip()
+
             if memory_id:
                 try:
                     self._memory.delete_memory(memory_id)
                     await self._send_text(context, chat_id, f"Done. Memory removed (id: {memory_id}).")
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Failed to delete memory: %s", exc)
-                    await self._send_text(context, chat_id, "Hmm, I couldn't remove that memory. Double-check the id?")
+                    await self._send_text(context, chat_id, "I couldn't find that memory. Check the id or use 'delete last'.")
             return
 
         # --- REMINDER ---

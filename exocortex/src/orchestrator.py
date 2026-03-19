@@ -138,6 +138,19 @@ def _has_time_cue(text: str) -> bool:
     )
 
 
+def _header_snippet(text: str, max_chars: int = 200, max_lines: int = 3) -> str:
+    """
+    Return a short header snippet (first non-empty lines) for intent classification.
+    This keeps the classifier focused on how the user phrases the request rather
+    than the full body of a long note or article.
+    """
+    if not text:
+        return ""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    header = "\n".join(lines[:max_lines])
+    return header[:max_chars]
+
+
 def _is_chitchat(text: str) -> bool:
     """Return True if the message is a greeting or social pleasantry."""
     t = text.strip().lower().rstrip("!.,?")
@@ -211,8 +224,11 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
     Use Groq to classify the user's intent into a structured action.
     Falls back to keyword heuristic if LLM call fails.
     """
+    raw_full = text or ""
+    header = _header_snippet(raw_full)
+
     # Fast-path: greetings / pleasantries — reply warmly, don't save
-    if _is_chitchat(text):
+    if _is_chitchat(header):
         return {
             "intent": INTENT_CHITCHAT,
             "confidence": 1.0,
@@ -221,7 +237,7 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
         }
 
     # Fast-path: explicit "save/note/log" commands are ingestion, not reminders
-    t = (text or "").strip().lower()
+    t = header.strip().lower()
     if t.startswith(("save this", "save:", "note this", "note:", "log this", "journal this")) and "http" not in t:
         return {
             "intent": INTENT_INGEST_TEXT,
@@ -232,7 +248,7 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
 
     # Fast-path: commitment + time cue => reminder (even if long)
     # Example: "i have to read this tomorrow ..." should be REMINDER.
-    if _COMMITMENT_RE.search(text or "") and _has_time_cue(text):
+    if _COMMITMENT_RE.search(header or "") and _has_time_cue(raw_full):
         return {
             "intent": INTENT_REMINDER,
             "confidence": 0.9,
@@ -242,8 +258,7 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
 
     # Fast-path: long or multiline text defaults to INGEST_TEXT (poems/brain dumps),
     # unless it has explicit reminder structure.
-    raw = text or ""
-    if ("\n" in raw or len(t) > 200) and ("remind me" not in t) and not _has_time_cue(text):
+    if ("\n" in raw_full or len(raw_full) > 200) and ("remind me" not in t) and not _has_time_cue(raw_full):
         return {
             "intent": INTENT_INGEST_TEXT,
             "confidence": 0.85,
@@ -252,7 +267,7 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
         }
 
     # Fast-path: obvious queries skip the LLM entirely
-    if _is_obvious_query(text):
+    if _is_obvious_query(header):
         return {
             "intent": INTENT_QUERY,
             "confidence": 0.95,
@@ -261,7 +276,7 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
         }
 
     # Fast-path: implicit reminders (time cue present, no question)
-    if _is_implicit_reminder(text):
+    if _is_implicit_reminder(header):
         return {
             "intent": INTENT_REMINDER,
             "confidence": 0.85,
@@ -274,7 +289,7 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
             model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": _CLASSIFICATION_SCHEMA},
-                {"role": "user", "content": text},
+                {"role": "user", "content": header},
             ],
             max_tokens=120,
             temperature=0.0,
@@ -296,7 +311,7 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
             intent = INTENT_UNKNOWN
 
         # Validator: never allow REMINDER without a detected time cue
-        if intent == INTENT_REMINDER and not _has_time_cue(text):
+        if intent == INTENT_REMINDER and not _has_time_cue(raw_full):
             intent = INTENT_INGEST_TEXT
             result["confidence"] = 0.6
             result["summary"] = "validator: reminder requires explicit time cue"

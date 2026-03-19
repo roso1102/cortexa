@@ -55,9 +55,13 @@ export default async function MemoriesPage({
         </div>
         <div className="divide-y divide-zinc-100">
           {data.items.map((m, idx) => {
-            const title = (m.title as string) || (m.file_name as string) || (m.url as string) || "Untitled";
-            const st = (m.source_type as string) || "text";
             const raw = (m.raw_content as string) || "";
+            const firstLine = raw
+              .split(/\r?\n/)
+              .map((l) => l.trim())
+              .find((l) => l.length > 0);
+            const title = (m.title as string) || firstLine || (m.file_name as string) || (m.url as string) || "Untitled";
+            const st = (m.source_type as string) || "text";
             const tagsArr = Array.isArray(m.tags) ? (m.tags as string[]) : [];
             return (
               <div key={(m.id as string) || `${idx}`} className="p-4">
