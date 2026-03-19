@@ -115,6 +115,27 @@ _REMINDER_TIME_CUES = (
 
 
 _AM_PM_RE = re.compile(r"\d\s*[ap]m\b")
+_HHMM_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
+_DATE_CUE_RE = re.compile(
+    r"\b(today|tomorrow|tonight|this (morning|afternoon|evening)|next (week|month|year|monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b",
+    re.IGNORECASE,
+)
+_IN_RE = re.compile(r"\bin\s+\d+\s+(minute|minutes|hour|hours|day|days|week|weeks)\b", re.IGNORECASE)
+_COMMITMENT_RE = re.compile(
+    r"\b(i have to|i need to|i should|i must|dont forget|don't forget|remember to)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_time_cue(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return bool(
+        _AM_PM_RE.search(t)
+        or _HHMM_RE.search(t)
+        or _DATE_CUE_RE.search(t)
+        or _IN_RE.search(t)
+        or any(cue in t for cue in _REMINDER_TIME_CUES)
+    )
 
 
 def _is_chitchat(text: str) -> bool:
@@ -209,6 +230,27 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
             "source": "pre-check",
         }
 
+    # Fast-path: commitment + time cue => reminder (even if long)
+    # Example: "i have to read this tomorrow ..." should be REMINDER.
+    if _COMMITMENT_RE.search(text or "") and _has_time_cue(text):
+        return {
+            "intent": INTENT_REMINDER,
+            "confidence": 0.9,
+            "summary": "pre-check: commitment phrase with time cue",
+            "source": "pre-check",
+        }
+
+    # Fast-path: long or multiline text defaults to INGEST_TEXT (poems/brain dumps),
+    # unless it has explicit reminder structure.
+    raw = text or ""
+    if ("\n" in raw or len(t) > 200) and ("remind me" not in t) and not _has_time_cue(text):
+        return {
+            "intent": INTENT_INGEST_TEXT,
+            "confidence": 0.85,
+            "summary": "pre-check: long/multiline note (no explicit time cue)",
+            "source": "pre-check",
+        }
+
     # Fast-path: obvious queries skip the LLM entirely
     if _is_obvious_query(text):
         return {
@@ -252,6 +294,13 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
             INTENT_UNKNOWN,
         }:
             intent = INTENT_UNKNOWN
+
+        # Validator: never allow REMINDER without a detected time cue
+        if intent == INTENT_REMINDER and not _has_time_cue(text):
+            intent = INTENT_INGEST_TEXT
+            result["confidence"] = 0.6
+            result["summary"] = "validator: reminder requires explicit time cue"
+
         return {
             "intent": intent,
             "confidence": float(result.get("confidence", 0.5)),
