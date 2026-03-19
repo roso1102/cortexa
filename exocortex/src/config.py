@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass, field
-from typing import FrozenSet
+from typing import Dict, FrozenSet
 
 
 class ConfigError(RuntimeError):
@@ -42,10 +42,12 @@ class AppConfig:
     daily_digest_time: str = ""
     # Owner chat ID for scheduler-initiated messages (reminders, daily digest)
     owner_chat_id: int = 0
-    # Token for dashboard API access (X-Dashboard-Token)
+    # Token signing key for dashboard API access (X-Dashboard-Token)
     dashboard_secret: str = ""
     # Public base URL for the web dashboard (used to create deep-links in Telegram)
     dashboard_public_url: str = ""
+    # Simple dashboard user registry: chat_id (as str) -> plaintext password
+    dashboard_users: Dict[str, str] = field(default_factory=dict)
 
 
 def load_config() -> AppConfig:
@@ -62,6 +64,23 @@ def load_config() -> AppConfig:
     except ValueError:
         owner_chat_id = 0
 
+    # Simple user registry for dashboard login.
+    # Format: CORTEXA_USERS="123456:password1,987654:password2"
+    users_raw = os.getenv("CORTEXA_USERS", "").strip()
+    users: Dict[str, str] = {}
+    if users_raw:
+        for part in users_raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" not in part:
+                continue
+            cid, pwd = part.split(":", 1)
+            cid = cid.strip()
+            pwd = pwd.strip()
+            if cid and pwd:
+                users[cid] = pwd
+
     return AppConfig(
         telegram_token=_get_env("TELEGRAM_TOKEN"),
         pinecone_api_key=_get_env("PINECONE_API_KEY"),
@@ -75,4 +94,5 @@ def load_config() -> AppConfig:
         owner_chat_id=owner_chat_id,
         dashboard_secret=os.getenv("DASHBOARD_SECRET", "").strip(),
         dashboard_public_url=os.getenv("DASHBOARD_PUBLIC_URL", "").strip(),
+        dashboard_users=users,
     )

@@ -4,30 +4,81 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 from urllib.parse import unquote
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, g
 from flask_cors import CORS
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from src.memory import MemoryManager
 from src.reflection import ReflectionService
 
 
-def create_api_blueprint(*, memory: MemoryManager, reflection: ReflectionService, dashboard_secret: str) -> Blueprint:
+def create_api_blueprint(
+    *,
+    memory: MemoryManager,
+    reflection: ReflectionService,
+    dashboard_secret: str,
+    dashboard_users: Dict[str, str],
+) -> Blueprint:
     """
     JSON API for the Cortexa dashboard.
 
-    Security model: single-user token auth.
-      - Require header: X-Dashboard-Token: <DASHBOARD_SECRET>
-      - CORS enabled for browser dashboard consumption
+    Security model: per-user token auth.
+      - POST /api/auth/login issues a signed token for a given chat_id/password.
+      - All other /api/* routes require header: X-Dashboard-Token: <token>
+      - CORS enabled for browser dashboard consumption.
     """
     bp = Blueprint("api", __name__, url_prefix="/api")
     CORS(bp)  # token auth still required; CORS just enables browser requests
 
+    serializer = URLSafeTimedSerializer(dashboard_secret or "cortexa-dashboard", salt="cortexa-dashboard")
+
     @bp.before_request
     def _auth() -> Any:
+        # Login endpoint is unauthenticated
+        if request.path.endswith("/auth/login"):
+            return None
+
         token = request.headers.get("X-Dashboard-Token", "").strip()
-        if not dashboard_secret or token != dashboard_secret:
+        if not dashboard_secret or not token:
             return jsonify({"error": "unauthorized"}), 401
+        try:
+            data = serializer.loads(token, max_age=7 * 24 * 3600)
+        except (BadSignature, SignatureExpired):
+            return jsonify({"error": "unauthorized"}), 401
+
+        user_id = data.get("user_id")
+        chat_id = data.get("chat_id")
+        if user_id is None or chat_id is None:
+            return jsonify({"error": "unauthorized"}), 401
+
+        g.user_id = int(user_id)
+        g.chat_id = int(chat_id)
         return None
+
+    @bp.post("/auth/login")
+    def login() -> Any:
+        if not dashboard_secret:
+            return jsonify({"error": "dashboard_auth_disabled"}), 503
+
+        body = request.get_json(silent=True) or {}
+        raw_chat_id = str(body.get("chat_id") or "").strip()
+        password = str(body.get("password") or "").strip()
+
+        if not raw_chat_id or not password:
+            return jsonify({"error": "invalid_credentials"}), 401
+
+        expected = dashboard_users.get(raw_chat_id)
+        if not expected or expected != password:
+            return jsonify({"error": "invalid_credentials"}), 401
+
+        try:
+            chat_id_int = int(raw_chat_id)
+        except ValueError:
+            return jsonify({"error": "invalid_credentials"}), 401
+
+        payload = {"user_id": chat_id_int, "chat_id": chat_id_int}
+        token = serializer.dumps(payload)
+        return jsonify({"token": token})
 
     @bp.get("/memories")
     def get_memories() -> Any:  # noqa: C901
@@ -45,7 +96,10 @@ def create_api_blueprint(*, memory: MemoryManager, reflection: ReflectionService
         page = max(int(request.args.get("page") or 1), 1)
         per_page = min(max(int(request.args.get("per_page") or 20), 1), 50)
 
-        filter_obj: Dict[str, Any] = {"archived": {"$ne": True}}
+        filter_obj: Dict[str, Any] = {
+            "archived": {"$ne": True},
+            "user_id": {"$eq": getattr(g, "user_id", 0)},
+        }
         if source_type:
             filter_obj["source_type"] = {"$eq": source_type}
 
@@ -95,7 +149,7 @@ def create_api_blueprint(*, memory: MemoryManager, reflection: ReflectionService
             normalized_id = prev
 
             md = memory.get_memory_by_id(normalized_id)
-            if not md:
+            if not md or int(md.get("user_id") or 0) != getattr(g, "user_id", 0):
                 return jsonify({"error": "not_found"}), 404
             return jsonify({"item": md})
         except Exception as exc:

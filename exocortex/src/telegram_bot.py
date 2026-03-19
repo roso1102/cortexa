@@ -84,8 +84,9 @@ class CortexaBot:
         start_ts = int(start.timestamp())
         end_ts = int(end.timestamp())
 
-        matches = self._memory.query_by_filter(
+        matches = self._memory.query_by_filter_for_chat(
             query_text="links saved today",
+            chat_id=chat_id,
             filter_obj={
                 "source_type": {"$eq": "link"},
                 "created_at_ts": {"$gte": start_ts, "$lt": end_ts},
@@ -321,9 +322,10 @@ class CortexaBot:
         Poems are detected heuristically via tags containing "poem".
         """
         # Pinecone metadata filters do not support "$contains" on arrays,
-        # so we fetch a broader slice and filter by tags client-side.
-        candidates = self._memory.query_by_filter(
+        # so we fetch a broader slice for this chat and filter by tags client-side.
+        candidates = self._memory.query_by_filter_for_chat(
             query_text="poem verse poetry",
+            chat_id=chat_id,
             filter_obj={},
             k=50,
         )
@@ -568,7 +570,7 @@ class CortexaBot:
             if reminder:
                 meta = reminder_to_metadata(reminder, chat_id=chat_id)
                 # Store canonical full reminder + optional chunks
-                base_meta = {**meta, "source_type": "reminder"}
+                base_meta = {**meta, "source_type": "reminder", "user_id": chat_id}
                 full_id = self._store_full_and_chunks(
                     text=reminder.text,
                     base_meta=base_meta,
@@ -618,6 +620,8 @@ class CortexaBot:
                         for idx, chunk in enumerate(chunks):
                             link_meta: dict[str, Any] = {
                                 "source_type": "link",
+                                "chat_id": chat_id,
+                                "user_id": chat_id,
                                 "url": extracted.url,
                                 "title": extracted.title or extracted.url,
                                 "chunk_index": idx,
@@ -647,6 +651,8 @@ class CortexaBot:
                                 f"Title: {title_guess}\nURL: {url}\n\n(Bookmark saved; content fetch failed.)",
                                 {
                                     "source_type": "link",
+                                    "chat_id": chat_id,
+                                    "user_id": chat_id,
                                     "url": url,
                                     "title": title_guess,
                                     "chunk_index": 0,
@@ -670,7 +676,7 @@ class CortexaBot:
 
         # --- QUERY ---
         if intent == INTENT_QUERY:
-            contexts = self._memory.recall_context(text, k=5)
+            contexts = self._memory.recall_context_for_chat(text, chat_id=chat_id, k=5)
             # If user is asking for a simple recall, avoid LLM and return snippets + dashboard links.
             if self._is_simple_recall_query(text) and contexts:
                 lines = ["Here's what I found in your memory:\n"]
@@ -726,6 +732,8 @@ class CortexaBot:
         tags = tag_text(text, self._groq_client)
         metadata: dict[str, Any] = {
             "source_type": "text",
+            "chat_id": chat_id,
+            "user_id": chat_id,
             "title": text[:80],
             "created_at": utc_now_iso(),
             "created_at_ts": utc_now_ts(),
@@ -807,6 +815,8 @@ class CortexaBot:
             for idx, chunk in enumerate(chunks):
                 pdf_meta: dict[str, Any] = {
                     "source_type": "pdf",
+                    "chat_id": chat_id,
+                    "user_id": chat_id,
                     "file_name": document.file_name,
                     "chunk_index": idx,
                     "created_at": utc_now_iso(),

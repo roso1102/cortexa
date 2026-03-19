@@ -38,6 +38,7 @@ def main() -> None:
         memory=memory,
         reflection=reflection,
         dashboard_secret=config.dashboard_secret,
+        dashboard_users=config.dashboard_users,
     )
     app.register_blueprint(api_bp)
 

@@ -117,6 +117,22 @@ class MemoryManager:
         )
         return memory_id
 
+    def query_by_filter_for_chat(
+        self,
+        query_text: str,
+        chat_id: int,
+        filter_obj: Dict[str, Any] | None = None,
+        k: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Convenience wrapper: apply a chat_id filter on top of the provided filter_obj.
+        Ensures multi-user isolation for Telegram-facing queries.
+        """
+        base_filter: Dict[str, Any] = {"chat_id": {"$eq": chat_id}}
+        if filter_obj:
+            base_filter.update(filter_obj)
+        return self.query_by_filter(query_text=query_text, filter_obj=base_filter, k=k)
+
     def query_by_filter(self, query_text: str, filter_obj: Dict[str, Any], k: int = 50) -> List[Dict[str, Any]]:
         """
         Pinecone requires a query vector. We embed a generic query_text and apply a metadata filter.
@@ -158,6 +174,46 @@ class MemoryManager:
                         )
                 except Exception:
                     pass  # access tracking is best-effort
+        return matches
+
+    def recall_context_for_chat(self, query: str, chat_id: int, k: int = 3) -> List[Dict[str, Any]]:
+        """
+        Like recall_context, but restricted to a specific chat_id.
+        Used by the Telegram bot so different users don't see each other's memories.
+        """
+        vector = self._embed(query)
+        res = self._index.query(
+            vector=vector,
+            top_k=k,
+            include_metadata=True,
+            filter={"chat_id": {"$eq": chat_id}, "archived": {"$ne": True}},
+        )
+        matches: List[Dict[str, Any]] = []
+        now_ts = utc_now_ts()
+        for match in res.get("matches", []):
+            md = match.get("metadata") or {}
+            if match.get("id"):
+                md["id"] = match.get("id")
+            md["score"] = match.get("score")
+            matches.append(md)
+            mem_id = match.get("id")
+            if mem_id:
+                try:
+                    updated = {**md, "last_accessed_ts": now_ts}
+                    updated.pop("score", None)
+                    raw = updated.get("raw_content", "")
+                    if raw:
+                        self._index.upsert(
+                            vectors=[
+                                {
+                                    "id": mem_id,
+                                    "values": match["values"] if "values" in match else vector,
+                                    "metadata": updated,
+                                }
+                            ]
+                        )
+                except Exception:
+                    pass
         return matches
 
     def soft_archive_low_priority(
@@ -236,3 +292,19 @@ class MemoryManager:
         except Exception:
             return None
         return None
+
+    def get_latest_memory_for_chat(self, chat_id: int) -> Dict[str, Any] | None:
+        """
+        Best-effort helper used for 'delete last'.
+        Fetches a slice of this chat's memories and returns the most recent by created_at_ts.
+        """
+        items = self.query_by_filter_for_chat(
+            query_text="latest memory for this chat",
+            chat_id=chat_id,
+            filter_obj={"archived": {"$ne": True}},
+            k=50,
+        )
+        if not items:
+            return None
+        items.sort(key=lambda m: int(m.get("created_at_ts") or 0), reverse=True)
+        return items[0]
