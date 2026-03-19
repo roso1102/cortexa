@@ -102,6 +102,90 @@ class ReflectionService:
 
         return f"{header}\n\n{llm_summary}"
 
+    def summarize_today_for_user(self, user_id: int) -> str:
+        """
+        Per-user variant of summarize_today, scoped by user_id.
+        Used by the dashboard so each user sees only their own day.
+        """
+        now = datetime.now(timezone.utc)
+        today = now.date()
+
+        contexts: List[Dict[str, Any]] = self._memory.recall_context_for_chat("today's focus", chat_id=user_id, k=50)
+
+        todays_texts: List[str] = []
+        type_counter: Counter = Counter()
+        tag_counter: Counter = Counter()
+
+        for m in contexts:
+            created_at = m.get("created_at")
+            raw = m.get("raw_content")
+            source_type = m.get("source_type", "text")
+            if not created_at or not raw:
+                continue
+            try:
+                dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if dt.date() == today:
+                todays_texts.append(raw)
+                type_counter[source_type] += 1
+                for tag in (m.get("tags") or []):
+                    tag_counter[str(tag)] += 1
+
+        # --- Upcoming reminders (next 24 h) ---
+        upcoming_reminders = self._get_upcoming_reminders(now, user_id=user_id)
+
+        if not todays_texts and not upcoming_reminders:
+            return "Nothing was captured today and no upcoming reminders."
+
+        # Build header with counts
+        header_parts: list[str] = []
+        if todays_texts:
+            breakdown = ", ".join(f"{count} {stype}(s)" for stype, count in sorted(type_counter.items()))
+            header_parts.append(f"Today you captured {len(todays_texts)} item(s): {breakdown}.")
+
+            # Topic distribution from tags
+            if tag_counter:
+                total_tags = sum(tag_counter.values())
+                top_topics = tag_counter.most_common(4)
+                topic_parts = []
+                for tag, count in top_topics:
+                    pct = round(count / total_tags * 100)
+                    topic_parts.append(f"{tag.title()} {pct}%")
+                header_parts.append("Topics: " + " | ".join(topic_parts))
+        if upcoming_reminders:
+            reminder_lines = "\n".join(f"  - {r}" for r in upcoming_reminders[:5])
+            header_parts.append(f"Upcoming reminders (next 24h):\n{reminder_lines}")
+
+        header = "\n".join(header_parts)
+
+        if not todays_texts:
+            return header
+
+        # --- LLM summary ---
+        joined = "\n\n---\n\n".join(todays_texts[:20])
+        prompt = (
+            "You are Exocortex, a personal cognitive assistant writing a daily reflection directly to the user.\n\n"
+            "Memories from today:\n"
+            f"{joined}\n\n"
+            "Write 3–5 concise bullet points summarizing what the user focused on today. "
+            "Address the user directly using 'you' and 'your' — never say 'the user' or 'they'. "
+            "Be specific, not generic. Example: 'You explored peanut allergy prevention...' not 'The user explored...'"
+        )
+
+        try:
+            chat = self._groq.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=400,
+                temperature=0.3,
+            )
+            llm_summary = chat.choices[0].message.content or "Unable to summarize."
+        except Exception:
+            llm_summary = "(LLM summary unavailable)"
+
+        return f"{header}\n\n{llm_summary}"
+
     def generate_weekly_diary(self) -> str:
         """
         Generate a narrative diary entry for the past 7 days.
@@ -283,35 +367,170 @@ class ReflectionService:
 
         full_profile = f"{profile_header}\n\n{narrative}"
 
-        # Store as profile_snapshot
+        # Store as profile_snapshot (owner/global variant)
         try:
-            self._memory.add_memory(full_profile, {
-                "source_type": "profile_snapshot",
-                "period": "monthly",
-                "month": now.strftime("%Y-%m"),
-                "created_at": utc_now_iso(),
-                "created_at_ts": utc_now_ts(),
-                "tags": ["profile", "monthly_snapshot"],
-            })
+            self._memory.add_memory(
+                full_profile,
+                {
+                    "source_type": "profile_snapshot",
+                    "period": "monthly",
+                    "month": now.strftime("%Y-%m"),
+                    "created_at": utc_now_iso(),
+                    "created_at_ts": utc_now_ts(),
+                    "tags": ["profile", "monthly_snapshot"],
+                },
+            )
         except Exception:
             pass
 
         return full_profile
 
-    def _get_upcoming_reminders(self, now: datetime) -> List[str]:
+    def generate_profile_snapshot_for_user(self, user_id: int) -> str:
+        """
+        Per-user profile snapshot used by the dashboard.
+        """
+        now = datetime.now(timezone.utc)
+
+        try:
+            all_memories = self._memory.query_by_filter_for_chat(
+                query_text="knowledge ideas notes memories thoughts",
+                chat_id=user_id,
+                filter_obj={"source_type": {"$nin": ["reminder", "diary_entry", "profile_snapshot"]}},
+                k=200,
+            )
+        except Exception:
+            return "(Profile generation failed: could not fetch memories.)"
+
+        if not all_memories:
+            return "Not enough memories to build a profile yet."
+
+        tag_counter: Counter = Counter()
+        tunnel_counter: Counter = Counter()
+        hour_counter: Counter = Counter()
+        oldest_ts = float("inf")
+        newest_ts = 0.0
+
+        for m in all_memories:
+            for tag in (m.get("tags") or []):
+                tag_counter[str(tag)] += 1
+            tunnel_name = m.get("tunnel_name")
+            if tunnel_name:
+                tunnel_counter[str(tunnel_name)] += 1
+            created_ts = float(m.get("created_at_ts") or 0)
+            if created_ts:
+                oldest_ts = min(oldest_ts, created_ts)
+                newest_ts = max(newest_ts, created_ts)
+                hour = datetime.fromtimestamp(created_ts, tz=timezone.utc).hour
+                hour_counter[hour] += 1
+
+        # Top topics
+        top_tags = tag_counter.most_common(6)
+        tag_line = ", ".join(f"{tag} ({cnt})" for tag, cnt in top_tags) if top_tags else "none yet"
+
+        # Top tunnels
+        top_tunnels = tunnel_counter.most_common(4)
+        tunnel_line = ", ".join(f'"{t}"' for t, _ in top_tunnels) if top_tunnels else "no tunnels formed yet"
+
+        # Time-of-day pattern
+        if hour_counter:
+            peak_hour = hour_counter.most_common(1)[0][0]
+            if 5 <= peak_hour < 12:
+                time_pattern = f"morning person (peak ~{peak_hour}:00 UTC)"
+            elif 12 <= peak_hour < 17:
+                time_pattern = f"afternoon thinker (peak ~{peak_hour}:00 UTC)"
+            else:
+                time_pattern = f"evening/night thinker (peak ~{peak_hour}:00 UTC)"
+        else:
+            time_pattern = "unknown"
+
+        oldest_label = (
+            datetime.fromtimestamp(oldest_ts, tz=timezone.utc).strftime("%b %Y")
+            if oldest_ts != float("inf")
+            else "N/A"
+        )
+        newest_label = (
+            datetime.fromtimestamp(newest_ts, tz=timezone.utc).strftime("%b %Y")
+            if newest_ts
+            else "N/A"
+        )
+
+        profile_header = (
+            f"Memory span: {oldest_label} → {newest_label}\n"
+            f"Total memories: {len(all_memories)}\n"
+            f"Active tunnels: {tunnel_line}\n"
+            f"Top topics: {tag_line}\n"
+            f"Capture pattern: {time_pattern}"
+        )
+
+        context_snippets = "\n".join(
+            f"- {str(m.get('raw_content', ''))[:150]}" for m in all_memories[:20]
+        )
+        prompt = (
+            "You are Exocortex, writing a monthly personal profile for the user.\n\n"
+            f"Profile data:\n{profile_header}\n\n"
+            f"Sample memories:\n{context_snippets}\n\n"
+            "Write a concise 3-4 sentence profile that tells the user who they are intellectually — "
+            "what they care about, how they think, and what's evolving in their interests. "
+            "Write directly to the user using 'you' and 'your'. Be specific and warm."
+        )
+        try:
+            chat = self._groq.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                temperature=0.4,
+            )
+            narrative = chat.choices[0].message.content or ""
+        except Exception:
+            narrative = "(LLM narrative unavailable)"
+
+        full_profile = f"{profile_header}\n\n{narrative}"
+
+        # Store as profile_snapshot for this user
+        try:
+            self._memory.add_memory(
+                full_profile,
+                {
+                    "source_type": "profile_snapshot",
+                    "period": "monthly",
+                    "month": now.strftime("%Y-%m"),
+                    "created_at": utc_now_iso(),
+                    "created_at_ts": utc_now_ts(),
+                    "tags": ["profile", "monthly_snapshot"],
+                    "user_id": user_id,
+                },
+            )
+        except Exception:
+            pass
+
+        return full_profile
+
+    def _get_upcoming_reminders(self, now: datetime, user_id: int | None = None) -> List[str]:
         """Return reminder texts due within the next 24 hours."""
         now_ts = int(now.timestamp())
         end_ts = int((now + timedelta(hours=24)).timestamp())
         try:
-            matches = self._memory.query_by_filter(
-                query_text="reminder",
-                filter_obj={
-                    "source_type": {"$eq": "reminder"},
-                    "due_at_ts": {"$gte": now_ts, "$lte": end_ts},
-                    "fired": {"$eq": False},
-                },
-                k=10,
-            )
+            if user_id is not None:
+                matches = self._memory.query_by_filter_for_chat(
+                    query_text="reminder",
+                    chat_id=user_id,
+                    filter_obj={
+                        "source_type": {"$eq": "reminder"},
+                        "due_at_ts": {"$gte": now_ts, "$lte": end_ts},
+                        "fired": {"$eq": False},
+                    },
+                    k=10,
+                )
+            else:
+                matches = self._memory.query_by_filter(
+                    query_text="reminder",
+                    filter_obj={
+                        "source_type": {"$eq": "reminder"},
+                        "due_at_ts": {"$gte": now_ts, "$lte": end_ts},
+                        "fired": {"$eq": False},
+                    },
+                    k=10,
+                )
         except Exception:
             return []
 

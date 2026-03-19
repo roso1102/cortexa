@@ -172,10 +172,15 @@ def create_api_blueprint(
         try:
             matches = memory.query_by_filter(
                 query_text="profile snapshot",
-                filter_obj={"source_type": {"$eq": "profile_snapshot"}},
+                filter_obj={
+                    "source_type": {"$eq": "profile_snapshot"},
+                    "user_id": {"$eq": getattr(g, "user_id", 0)},
+                },
                 k=1,
             )
             snapshot = matches[0].get("raw_content") if matches else ""
+            if not snapshot:
+                snapshot = reflection.generate_profile_snapshot_for_user(getattr(g, "user_id", 0))
         except Exception as exc:
             return jsonify({"error": str(exc), "snapshot": ""}), 500
         return jsonify({"snapshot": snapshot})
@@ -183,7 +188,7 @@ def create_api_blueprint(
     @bp.get("/summary/today")
     def get_summary_today() -> Any:
         try:
-            text = reflection.summarize_today()
+            text = reflection.summarize_today_for_user(getattr(g, "user_id", 0))
         except Exception as exc:
             return jsonify({"error": str(exc), "text": ""}), 500
         return jsonify(
