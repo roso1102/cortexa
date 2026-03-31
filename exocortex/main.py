@@ -10,6 +10,7 @@ from src.memory import MemoryManager
 from src.reflection import ReflectionService
 from src.telegram_bot import run_bot
 from src.api import create_api_blueprint
+from src.db import init_db
 
 
 app = Flask(__name__)
@@ -29,6 +30,10 @@ def main() -> None:
         config = load_config()
     except ConfigError as exc:
         raise SystemExit(str(exc)) from exc
+
+    # Option B: canonical Postgres foundation (best-effort init).
+    # If DATABASE_URL is not configured yet, this is a no-op.
+    init_db()
 
     # Dashboard API layer — always registered; auth handled inside the blueprint.
     # If DASHBOARD_SECRET is not set, every /api/* request returns 401.

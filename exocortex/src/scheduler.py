@@ -194,25 +194,28 @@ class ReminderScheduler:
         try:
             cutoff_ts = int((now - timedelta(days=7)).astimezone(timezone.utc).timestamp())
             now_ts = int(now.astimezone(timezone.utc).timestamp())
-            old_memories = self._memory.get_old_memories_for_user(
+            from src.db import fetch_old_main_memories_for_user, update_memory_last_resurfaced_ts
+
+            old_memories = fetch_old_main_memories_for_user(
                 user_id=self._owner_chat_id,
                 older_than_ts=cutoff_ts,
                 exclude_source_types=["reminder", "diary_entry", "tunnel", "profile_snapshot"],
-                k=50,
+                limit=100,
             )
 
             if not old_memories:
                 self._resurface_sent_date = today_str
                 return
 
-            # Score: semantic similarity + aging + priority_score boost; exclude recently resurfaced
+            # Score: priority + aging; exclude recently resurfaced.
+            # (We intentionally do not rely on Pinecone's approximate top_k "score" here
+            # so the selection is deterministic and chunk-safe.)
             scored: List[tuple[float, dict]] = []
             for m in old_memories:
                 created_ts = int(m.get("created_at_ts") or 0)
                 last_accessed_ts = int(m.get("last_accessed_ts") or created_ts)
                 last_resurfaced_ts = int(m.get("last_resurfaced_ts") or 0)
                 priority = float(m.get("priority_score") or 0.5)
-                score = float(m.get("score") or 0.5)
 
                 # Skip recently resurfaced (within 3 days)
                 days_since_resurface = (now_ts - last_resurfaced_ts) / 86400 if last_resurfaced_ts else 999
@@ -222,7 +225,7 @@ class ReminderScheduler:
                 days_since = max(0, (now_ts - last_accessed_ts) / 86400)
                 aging = min(days_since / 90, 1.0)
 
-                resurface_score = (score * 0.4) + (aging * 0.4) + (priority * 0.2)
+                resurface_score = (aging * 0.45) + (priority * 0.45) + (0.10 * (1.0 / (1.0 + (days_since + 1.0))))
                 scored.append((resurface_score, m))
 
             scored.sort(key=lambda x: x[0], reverse=True)
@@ -262,6 +265,11 @@ class ReminderScheduler:
                 # Mark as resurfaced
                 try:
                     self._memory.update_memory_metadata(mem_id, {"last_resurfaced_ts": now_ts})
+                    update_memory_last_resurfaced_ts(
+                        user_id=self._owner_chat_id,
+                        memory_id=str(mem_id),
+                        last_resurfaced_ts=now_ts,
+                    )
                 except Exception:
                     pass
 
@@ -288,7 +296,7 @@ class ReminderScheduler:
             return
 
         try:
-            diary = self._reflection.generate_weekly_diary()
+            diary = self._reflection.generate_weekly_diary_for_user(self._owner_chat_id)
             if diary:
                 self._send_telegram(self._owner_chat_id, f"Weekly diary:\n\n{diary}")
                 self._diary_sent_week = week_str
@@ -369,7 +377,7 @@ class ReminderScheduler:
             return
 
         try:
-            profile = self._reflection.generate_profile_snapshot()
+            profile = self._reflection.generate_profile_snapshot_for_user(self._owner_chat_id)
             if profile:
                 self._send_telegram(self._owner_chat_id, f"Monthly profile:\n\n{profile}")
             self._profile_sent_month = month_str

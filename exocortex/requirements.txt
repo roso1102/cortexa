@@ -12,3 +12,5 @@ PyMuPDF==1.24.10
 python-dateutil==2.9.0
 requests==2.32.3
 trafilatura==1.8.1
+SQLAlchemy
+psycopg2-binary

@@ -30,6 +30,11 @@ from groq import Groq
 from openai import OpenAI
 
 from src.memory import MemoryManager
+from src.db import (
+    fetch_main_memories_for_user_for_tunnels,
+    insert_tunnel_and_members,
+    update_memory_tunnel_fields,
+)
 from src.utils import utc_now_iso, utc_now_ts
 
 logger = logging.getLogger(__name__)
@@ -57,17 +62,27 @@ def form_tunnels(memory: MemoryManager, groq: Groq, *, user_id: int, openrouter_
     Returns a list of tunnel dicts that were created (or updated).
     """
     logger.info("Starting tunnel formation")
+    # Prefer canonical Postgres memories (prevents chunk/tunnel leakage and improves accuracy).
     try:
-        memories = memory.query_by_filter_for_chat(
-            query_text="knowledge ideas notes memories thoughts",
-            chat_id=user_id,
-            filter_obj={"source_type": {"$nin": ["reminder", "diary_entry", "tunnel", "profile_snapshot"]}},
-            k=400,
+        memories = fetch_main_memories_for_user_for_tunnels(
+            user_id=user_id,
+            exclude_source_types=["reminder", "diary_entry", "tunnel", "profile_snapshot"],
+            limit=400,
         )
-        memories = [m for m in memories if memory.is_main_memory(m)]
+        # Canonical fetch returns only main records; no need memory.is_main_memory here.
     except Exception:
-        logger.exception("Failed to fetch memories for tunnel formation")
-        return []
+        logger.exception("Failed to fetch canonical memories for tunnel formation; falling back to Pinecone.")
+        try:
+            memories = memory.query_by_filter_for_chat(
+                query_text="knowledge ideas notes memories thoughts",
+                chat_id=user_id,
+                filter_obj={"source_type": {"$nin": ["reminder", "diary_entry", "tunnel", "profile_snapshot"]}},
+                k=400,
+            )
+            memories = [m for m in memories if memory.is_main_memory(m)]
+        except Exception:
+            logger.exception("Failed to fetch memories for tunnel formation (Pinecone fallback)")
+            return []
 
     if not memories:
         logger.info("No memories available for tunnel formation")
@@ -124,15 +139,45 @@ def form_tunnels(memory: MemoryManager, groq: Groq, *, user_id: int, openrouter_
         # Ask OpenRouter to name + explain the tunnel (better reasoning)
         tunnel_name, tunnel_reason = _name_tunnel_openrouter(openrouter_api_key, tag, snippets_for_llm)
 
-        # Store tunnel object in Pinecone
-        tunnel_text = (
-            f"Tunnel: {tunnel_name}\n"
-            f"Why these connect: {tunnel_reason}\n"
-            f"Core tag: {tag}\n"
-            f"Memories: {len(unique_mems)}\n\n"
-            + "\n".join(f"- {s[:100]}" for s in snippets_for_llm[:3])
-        )
+        # Persist tunnel + membership in Postgres (canonical).
+        try:
+            insert_tunnel_and_members(
+                tunnel_id=tunnel_id,
+                user_id=user_id,
+                name=tunnel_name,
+                reason=tunnel_reason,
+                core_tag=tag,
+                memory_count=len(unique_mems),
+                created_at_ts=now_ts,
+                raw="\n".join(f"- {s[:100]}" for s in snippets_for_llm[:3]),
+                member_memory_ids=[str(m.get("id") or "") for m in unique_mems if m.get("id")],
+            )
+        except Exception:
+            logger.exception("Failed to persist tunnel in Postgres: %s", tunnel_name)
+            # Keep best-effort stamping on existing memory metadata.
+
+        # Stamp constituent memories with tunnel_id/tunnel_name in both stores.
+        stamped = 0
+        for m in unique_mems:
+            mem_id = str(m.get("id") or "").strip()
+            if not mem_id:
+                continue
+            try:
+                # Pinecone metadata stamp for downstream profile/UX that still reads Pinecone.
+                memory.update_memory_metadata(mem_id, {"tunnel_id": tunnel_id, "tunnel_name": tunnel_name})
+                # Canonical stamp for Option B correctness.
+                update_memory_tunnel_fields(
+                    user_id=user_id,
+                    memory_id=mem_id,
+                    tunnel_id=tunnel_id,
+                    tunnel_name=tunnel_name,
+                )
+                stamped += 1
+            except Exception:
+                pass  # best-effort
+
         tunnel_metadata: Dict[str, Any] = {
+            "id": tunnel_id,
             "source_type": "tunnel",
             "tunnel_name": tunnel_name,
             "reason": tunnel_reason,
@@ -142,28 +187,10 @@ def form_tunnels(memory: MemoryManager, groq: Groq, *, user_id: int, openrouter_
             "created_at_ts": now_ts,
             "tags": ["tunnel", tag],
             "user_id": user_id,
+            "stamped_count": stamped,
         }
-        try:
-            memory.add_memory(tunnel_text, {**tunnel_metadata, "id": tunnel_id})
-            logger.info("Created tunnel: %s (tag=%s, memories=%d)", tunnel_name, tag, len(unique_mems))
-        except Exception:
-            logger.exception("Failed to store tunnel: %s", tunnel_name)
-            continue
-
-        # Stamp constituent memories with tunnel_id (best-effort)
-        stamped = 0
-        for m in unique_mems:
-            mem_id = m.get("id") or m.get("created_at", "")
-            if not mem_id:
-                continue
-            try:
-                memory.update_memory_metadata(mem_id, {"tunnel_id": tunnel_id, "tunnel_name": tunnel_name})
-                stamped += 1
-            except Exception:
-                pass  # best-effort
-
         logger.info("Stamped %d/%d memories with tunnel_id=%s", stamped, len(unique_mems), tunnel_id)
-        created_tunnels.append({**tunnel_metadata, "id": tunnel_id, "stamped_count": stamped})
+        created_tunnels.append(tunnel_metadata)
 
     return created_tunnels
 

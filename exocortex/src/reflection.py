@@ -108,13 +108,27 @@ class ReflectionService:
         """
         now_ist = ist_now()
         start_ts, end_ts = ist_day_range_utc_ts(now_ist)
-        contexts: List[Dict[str, Any]] = self._memory.query_by_filter_for_chat(
-            query_text="today memories",
-            chat_id=user_id,
-            filter_obj={"created_at_ts": {"$gte": start_ts, "$lt": end_ts}, "archived": {"$ne": True}},
-            k=400,
-        )
-        contexts = [m for m in contexts if self._memory.is_main_memory(m)]
+        # Deterministic selection: avoid Pinecone similarity/top_k misses for "created today".
+        contexts: List[Dict[str, Any]] = []
+        try:
+            from src.db import fetch_memories_for_user_created_range
+
+            contexts = fetch_memories_for_user_created_range(
+                user_id=user_id,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                limit=400,
+            )
+            contexts = [m for m in contexts if self._memory.is_main_memory(m)]
+        except Exception:
+            # Fallback: keep system functional if Postgres isn't configured yet.
+            contexts = self._memory.query_by_filter_for_chat(
+                query_text="today memories",
+                chat_id=user_id,
+                filter_obj={"created_at_ts": {"$gte": start_ts, "$lt": end_ts}, "archived": {"$ne": True}},
+                k=400,
+            )
+            contexts = [m for m in contexts if self._memory.is_main_memory(m)]
 
         todays_texts: List[str] = []
         type_counter: Counter = Counter()
@@ -264,6 +278,93 @@ class ReflectionService:
 
         return diary_text
 
+    def generate_weekly_diary_for_user(self, user_id: int) -> str:
+        """
+        User-scoped weekly diary (Option B canonical correctness).
+        Uses Postgres canonical main memories instead of Pinecone similarity/top_k.
+        Stored as source_type=diary_entry (user-scoped) for later reasoning.
+        """
+        from src.db import fetch_memories_for_user_created_range
+        from src.utils import ist_now
+
+        now_ist = ist_now()
+        start_ist = now_ist - timedelta(days=7)
+        start_ts = int(start_ist.astimezone(timezone.utc).timestamp())
+        end_ts = int(now_ist.astimezone(timezone.utc).timestamp())
+
+        # Pull canonical main memories deterministically from Postgres.
+        try:
+            memories = fetch_memories_for_user_created_range(
+                user_id=user_id,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                limit=120,
+            )
+        except Exception:
+            memories = []
+
+        if not memories:
+            return "Nothing was captured this week."
+
+        type_counter: Counter = Counter()
+        tag_counter: Counter = Counter()
+        texts: List[str] = []
+        for m in memories:
+            raw = m.get("raw_content") or ""
+            if raw:
+                texts.append(str(raw)[:300])
+            type_counter[str(m.get("source_type", "text"))] += 1
+            for tag in (m.get("tags") or []):
+                tag_counter[str(tag)] += 1
+
+        now_utc = datetime.now(timezone.utc)
+        type_summary = ", ".join(f"{count} {stype}(s)" for stype, count in sorted(type_counter.items()))
+        top_tags = [tag for tag, _ in tag_counter.most_common(5)]
+        tag_line = ", ".join(top_tags) if top_tags else "mixed topics"
+
+        joined = "\n\n---\n\n".join(texts[:30])
+        prompt = (
+            "You are Exocortex, writing a personal weekly diary entry for the user.\n\n"
+            f"This week ({now_utc.strftime('%B %d, %Y')}) you captured {len(memories)} item(s): {type_summary}.\n"
+            f"Main topics: {tag_line}.\n\n"
+            "Memories from this week:\n"
+            f"{joined}\n\n"
+            "Write a warm, reflective diary entry (3-5 sentences) summarizing the week. "
+            "Write directly to the user using 'you' and 'your'. "
+            "Mention specific topics, patterns, or interesting things you noticed. "
+            "End with a short encouraging line about what to focus on next."
+        )
+
+        try:
+            chat = self._groq.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=350,
+                temperature=0.5,
+            )
+            diary_text = chat.choices[0].message.content or ""
+        except Exception:
+            return "(Weekly diary generation failed.)"
+
+        # Store diary entry in Pinecone for continuity (best-effort).
+        try:
+            diary_metadata: Dict[str, Any] = {
+                "source_type": "diary_entry",
+                "period": "weekly",
+                "week_ending": now_utc.strftime("%Y-%m-%d"),
+                "created_at": utc_now_iso(),
+                "created_at_ts": utc_now_ts(),
+                "tags": ["diary", "weekly_reflection"],
+                "chat_id": user_id,
+                "user_id": user_id,
+                "priority_score": 0.5,
+            }
+            self._memory.add_memory(diary_text, diary_metadata)
+        except Exception:
+            pass
+
+        return diary_text
+
     def generate_profile_snapshot(self) -> str:
         """
         Monthly personal profile: top tunnels, dominant topics, time-of-day patterns,
@@ -390,11 +491,15 @@ class ReflectionService:
         now = datetime.now(timezone.utc)
 
         try:
-            all_memories = self._memory.query_by_filter_for_chat(
-                query_text="knowledge ideas notes memories thoughts",
-                chat_id=user_id,
-                filter_obj={"source_type": {"$nin": ["reminder", "diary_entry", "profile_snapshot"]}},
-                k=200,
+            from src.db import fetch_main_memories_for_user_for_profile
+
+            # Canonical selection from Postgres:
+            # - deterministic
+            # - main records only (no chunk/tunnel leakage)
+            all_memories = fetch_main_memories_for_user_for_profile(
+                user_id=user_id,
+                exclude_source_types=["reminder", "diary_entry", "profile_snapshot", "tunnel"],
+                limit=500,
             )
         except Exception:
             return "(Profile generation failed: could not fetch memories.)"

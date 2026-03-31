@@ -13,12 +13,15 @@ from src.utils import utc_now_iso, utc_now_ts
 
 logger = logging.getLogger(__name__)
 
-# Simple in-process LRU-style embedding cache.
-# Stores up to _EMBED_CACHE_SIZE distinct texts. Avoids re-embedding the same
-# repeated query strings (e.g. "reminder" called every 10 s by the scheduler).
 _EMBED_CACHE_SIZE = 128
 _embed_cache: Dict[str, List[float]] = {}
 _embed_cache_order: List[str] = []
+
+# To keep Pinecone metadata under the 40KB limit, we must not
+# store arbitrarily large raw_content blobs. We keep a generous
+# but safe truncated version here; the canonical full text now
+# lives in Postgres.
+_MAX_RAW_CONTENT_METADATA_CHARS = 20000
 
 # Back-off state: when a 429 quota error is hit, stop embedding for this many
 # seconds so we don't burn the remaining daily quota in a tight retry loop.
@@ -57,6 +60,7 @@ class MemoryManager:
 
         # Return cached vector if available
         if text in _embed_cache:
+            logger.debug("embed cache hit (len=%d)", len(text))
             return _embed_cache[text]
 
         # Honour quota back-off: if we recently hit 429, skip embedding for now
@@ -93,15 +97,21 @@ class MemoryManager:
             _embed_cache[text] = embedding
             _embed_cache_order.append(text)
 
+        logger.debug("embed success (len=%d, dim=%d)", len(text), len(embedding))
         return embedding
 
     def add_memory(self, text: str, metadata: Dict[str, Any]) -> str:
         vector = self._embed(text)
         memory_id = metadata.get("id") or utc_now_iso()
 
+        # Truncate raw_content stored inside Pinecone metadata so we don't
+        # hit the 40KB metadata size limit. Canonical full text is stored
+        # in Postgres; Pinecone only needs enough for retrieval + snippets.
+        raw_for_metadata = text[:_MAX_RAW_CONTENT_METADATA_CHARS]
+
         md = {
             **metadata,
-            "raw_content": text,
+            "raw_content": raw_for_metadata,
             "created_at": metadata.get("created_at", utc_now_iso()),
             "created_at_ts": metadata.get("created_at_ts", utc_now_ts()),
         }
@@ -114,6 +124,11 @@ class MemoryManager:
                     "metadata": md,
                 }
             ]
+        )
+        logger.debug(
+            "pinecone upsert ok id=%s meta_raw_len=%d",
+            memory_id,
+            len(raw_for_metadata),
         )
         return memory_id
 

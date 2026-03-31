@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import ipaddress
+import html as html_lib
 import re
 import socket
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 import trafilatura
@@ -61,6 +62,51 @@ def validate_url(url: str) -> Optional[str]:
     return None
 
 
+def _try_extract_x_oembed(url: str, *, timeout_s: int) -> LinkExtract | None:
+    """
+    Server-side extraction for X/Twitter status URLs using oEmbed.
+
+    X frequently blocks HTML extraction (JS-only / anti-bot). oEmbed often still works
+    and returns readable tweet HTML that we can strip to text.
+    """
+    try:
+        oembed_url = (
+            "https://publish.twitter.com/oembed"
+            f"?url={quote(url, safe='')}&omit_script=true"
+        )
+        headers = {
+            "User-Agent": "cortexa/0.1 (x-oembed; +https://example.local)",
+            "Accept": "application/json,text/plain,*/*",
+        }
+        resp = requests.get(oembed_url, headers=headers, timeout=timeout_s)
+        resp.raise_for_status()
+
+        data = resp.json()
+        html_block = str(data.get("html") or "").strip()
+        if not html_block:
+            return None
+
+        author = str(data.get("author_name") or "").strip()
+        title = f"Tweet by {author}" if author else "Tweet"
+
+        # Strip tags from the oEmbed HTML to get readable text.
+        text = re.sub(r"<[^>]+>", " ", html_block)
+        text = html_lib.unescape(text)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        # Basic sanity check: avoid embedding garbage.
+        if len(text) < 40:
+            return None
+
+        text = _sanitize_extracted(text)
+        if not text.strip():
+            return None
+
+        return LinkExtract(url=url, title=title, text=text)
+    except Exception:
+        return None
+
+
 @dataclass
 class LinkExtract:
     url: str
@@ -100,6 +146,13 @@ def fetch_and_extract(url: str, timeout_s: int = 15, max_bytes: int = 2_000_000)
     - uses timeouts
     - does NOT execute JS (requests only)
     """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host in {"x.com", "twitter.com"} or host.endswith(".x.com") or host.endswith(".twitter.com"):
+        x = _try_extract_x_oembed(url, timeout_s=timeout_s)
+        if x and x.text:
+            return x
+
     headers = {
         "User-Agent": "cortexa/0.1 (link-ingestion; +https://example.local)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",

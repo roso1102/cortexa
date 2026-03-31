@@ -7,6 +7,7 @@ from urllib.parse import unquote
 from flask import Blueprint, jsonify, request, g
 from flask_cors import CORS
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from werkzeug.security import check_password_hash
 
 from src.memory import MemoryManager
 from src.reflection import ReflectionService
@@ -67,14 +68,23 @@ def create_api_blueprint(
         if not raw_chat_id or not password:
             return jsonify({"error": "invalid_credentials"}), 401
 
-        expected = dashboard_users.get(raw_chat_id)
-        if not expected or expected != password:
-            return jsonify({"error": "invalid_credentials"}), 401
-
         try:
             chat_id_int = int(raw_chat_id)
         except ValueError:
             return jsonify({"error": "invalid_credentials"}), 401
+
+        # Prefer Postgres-backed auth (Option B).
+        # Backward-compatible fallback: if DATABASE_URL is not configured, use CORTEXA_USERS map.
+        try:
+            from src.db import get_user_by_chat_id
+
+            user = get_user_by_chat_id(chat_id_int)
+            if not user or not check_password_hash(user.password_hash, password):
+                return jsonify({"error": "invalid_credentials"}), 401
+        except RuntimeError:
+            expected = dashboard_users.get(raw_chat_id)
+            if not expected or expected != password:
+                return jsonify({"error": "invalid_credentials"}), 401
 
         payload = {"user_id": chat_id_int, "chat_id": chat_id_int}
         token = serializer.dumps(payload)
@@ -181,13 +191,16 @@ def create_api_blueprint(
     @bp.get("/tunnels")
     def get_tunnels() -> Any:
         try:
+            from src.db import fetch_tunnels_for_user
+
+            tunnels = fetch_tunnels_for_user(user_id=int(getattr(g, "user_id", 0)), limit=30)
+        except Exception:
+            # Fallback: legacy Pinecone tunnel objects (if Postgres not configured yet)
             tunnels = memory.query_by_filter(
                 query_text="tunnels themes clusters",
                 filter_obj={"source_type": {"$eq": "tunnel"}},
                 k=30,
             )
-        except Exception as exc:
-            return jsonify({"error": str(exc), "tunnels": []}), 500
         return jsonify({"tunnels": tunnels})
 
     @bp.get("/profile")

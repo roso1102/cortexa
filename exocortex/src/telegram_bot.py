@@ -28,6 +28,7 @@ from src.utils import chunk_text, utc_now_iso, utc_now_ts
 from src.reminders import parse_reminder_llm, reminder_to_metadata
 from src.link_ingest import extract_urls, validate_url, fetch_and_extract
 from src.tagger import tag_text
+from src.retrieval import HybridRetriever
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ class CortexaBot:
         self._config = config
         self._memory = MemoryManager(config)
         self._brains = BrainsRouter(config)
+        self._retriever = HybridRetriever(self._memory)
         self._reflection = ReflectionService(config, self._memory)
         self._debug_mode = config.debug_mode
         self._groq_client = Groq(api_key=config.groq_api_key)
@@ -190,7 +192,7 @@ class CortexaBot:
     async def handle_summary_today(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
         if not update.effective_chat:
             return
-        summary = self._reflection.summarize_today()
+        summary = self._reflection.summarize_today_for_user(update.effective_chat.id)
         await self._send_text(context, update.effective_chat.id, summary)
 
     async def handle_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
@@ -198,9 +200,9 @@ class CortexaBot:
             return
         chat_id = update.effective_chat.id
         # Prefer latest stored snapshot; generate if missing
-        profile = self._get_latest_profile()
+        profile = self._get_latest_profile(chat_id)
         if not profile:
-            profile = self._reflection.generate_profile_snapshot()
+            profile = self._reflection.generate_profile_snapshot_for_user(chat_id)
         await self._send_text(context, chat_id, f"Your profile snapshot:\n\n{profile}")
 
     async def handle_tunnels(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
@@ -302,12 +304,17 @@ class CortexaBot:
             return True  # open/single-user mode
         return chat_id in self._config.allowed_chat_ids
 
-    def _get_latest_profile(self) -> str | None:
+    def _get_latest_profile(self, chat_id: int) -> str | None:
         """Fetch the most recent profile_snapshot from memory to personalise query answers."""
         try:
-            matches = self._memory.query_by_filter(
-                query_text="personal profile interests tunnels topics",
-                filter_obj={"source_type": {"$eq": "profile_snapshot"}},
+            matches = self._memory.query_by_filter_for_chat(
+                query_text="profile snapshot interests tunnels topics",
+                chat_id=chat_id,
+                filter_obj={
+                    "source_type": {"$eq": "profile_snapshot"},
+                    "user_id": {"$eq": chat_id},
+                    "archived": {"$ne": True},
+                },
                 k=1,
             )
             if matches:
@@ -382,6 +389,15 @@ class CortexaBot:
         Store a canonical full record (entire text) and optional chunk children for retrieval/understanding.
         Returns the full record's memory_id.
         """
+        # Dual-write for Option B:
+        # - Pinecone: used by current retrieval
+        # - Postgres: canonical store for later hybrid retrieval + dashboard correctness
+        try:
+            from src.db import insert_chunks, insert_memory
+        except Exception:
+            insert_chunks = None  # type: ignore[assignment]
+            insert_memory = None  # type: ignore[assignment]
+
         full_id = utc_now_iso()
         full_meta = {
             **base_meta,
@@ -391,7 +407,29 @@ class CortexaBot:
         }
         self._memory.add_memory(text, full_meta)
 
+        if insert_memory is not None:
+            row = {
+                "memory_id": full_id,
+                "user_id": int(base_meta.get("user_id") or base_meta.get("chat_id") or 0),
+                "chat_id": base_meta.get("chat_id"),
+                "title": base_meta.get("title"),
+                "raw_content_full": text,
+                "source_type": str(base_meta.get("source_type") or "text"),
+                "source_url": base_meta.get("url") or base_meta.get("source_url"),
+                "tags": base_meta.get("tags"),
+                "created_at_ts": int(base_meta.get("created_at_ts") or utc_now_ts()),
+                "due_at_ts": base_meta.get("due_at_ts"),
+                "last_accessed_ts": base_meta.get("last_accessed_ts"),
+                "priority_score": float(base_meta.get("priority_score") or 0.5),
+                "last_resurfaced_ts": base_meta.get("last_resurfaced_ts"),
+                "visibility": base_meta.get("visibility"),
+                "parent_id": base_meta.get("parent_id"),
+                "is_full": True,
+            }
+            insert_memory(row)
+
         # Store chunks only for long text
+        chunk_rows: list[dict[str, Any]] = []
         if len(text) > 900:
             chunks = chunk_text(text)[:30]
             for idx, chunk in enumerate(chunks):
@@ -403,7 +441,23 @@ class CortexaBot:
                     "is_full": False,
                     "priority_score": float(base_meta.get("priority_score") or 0.5),
                 }
-                self._memory.add_memory(chunk, child_meta)
+                child_id = self._memory.add_memory(chunk, child_meta)
+                if insert_chunks is not None:
+                    chunk_rows.append(
+                        {
+                            "chunk_id": child_id,
+                            "memory_id": full_id,
+                            "user_id": int(base_meta.get("user_id") or base_meta.get("chat_id") or 0),
+                            "chat_id": base_meta.get("chat_id"),
+                            "chunk_index": idx,
+                            "chunk_text": chunk,
+                            "source_type": chunk_source_type,
+                            "created_at_ts": int(base_meta.get("created_at_ts") or utc_now_ts()),
+                        }
+                    )
+
+        if insert_chunks is not None and chunk_rows:
+            insert_chunks(chunk_rows)
 
         return full_id
 
@@ -416,6 +470,85 @@ class CortexaBot:
         if any(kw in t for kw in ["analyze", "analysis", "plan", "compare", "summarize", "summarise", "propose", "debug"]):
             return False
         return any(p in t for p in ["what did i save", "what i saved", "show me what i saved", "recall what i saved", "what do i know about"])
+
+    def _rerank_simple_recall(self, contexts: list[dict[str, Any]], user_text: str) -> list[dict[str, Any]]:
+        """
+        Pinecone semantic recall is sometimes too fuzzy for "what did I save about X".
+        For this UX we do a deterministic re-rank using:
+        title + raw_content + tags substring hits, combined with the Pinecone prior score.
+        """
+        stopwords = {
+            "what",
+            "did",
+            "i",
+            "save",
+            "saved",
+            "show",
+            "me",
+            "my",
+            "recall",
+            "about",
+            "know",
+            "tell",
+            "anything",
+            "everything",
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "to",
+            "of",
+            "in",
+            "for",
+            "on",
+            "with",
+            "is",
+            "are",
+            "was",
+            "were",
+            "it",
+            "this",
+            "that",
+            "please",
+        }
+
+        tokens = re.findall(r"[a-z0-9]+", (user_text or "").lower())
+        tokens = [t for t in tokens if t not in stopwords and len(t) >= 3]
+        if not tokens:
+            tokens = re.findall(r"[a-z0-9]+", (user_text or "").lower())[:6]
+
+        rescored: list[tuple[float, float, dict[str, Any]]] = []
+        max_lex = 0.0
+        for m in contexts:
+            title_l = str(m.get("title") or "").lower()
+            raw_l = str(m.get("raw_content") or "").lower()
+            tags_l = " ".join([str(t).lower() for t in (m.get("tags") or [])])
+            prior = float(m.get("score") or 0.0)
+
+            lex = 0.0
+            for tok in tokens[:10]:
+                if tok in title_l:
+                    lex += 3.0
+                elif tok in tags_l:
+                    lex += 2.0
+                elif tok in raw_l:
+                    lex += 1.0
+
+            max_lex = max(max_lex, lex)
+            rescored.append((prior + lex, lex, m))
+
+        # If we have any items with lexical hits, drop pure semantic junk.
+        filtered: list[tuple[float, float, dict[str, Any]]] = []
+        if max_lex > 0:
+            for total, lex, m in rescored:
+                if lex > 0:
+                    filtered.append((total, lex, m))
+        else:
+            filtered = rescored
+
+        filtered.sort(key=lambda x: x[0], reverse=True)
+        return [m for _, _, m in filtered]
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
         if not update.effective_chat or not update.message or not update.message.text:
@@ -584,7 +717,11 @@ class CortexaBot:
                 )
                 if self._debug_mode:
                     await self._send_text(context, chat_id, f"[debug] intent=REMINDER due={reminder.due_at_iso}")
-                    await self._send_text(context, chat_id, f"[debug] reminder_full_id={full_id}")
+                    await self._send_text(
+                        context,
+                        chat_id,
+                        f"[debug] reminder_saved full_id={full_id} len={len(reminder.text)}",
+                    )
                 return
             # If reminder parsing fails, fall through to INGEST_TEXT
 
@@ -642,28 +779,37 @@ class CortexaBot:
                             f"You can ask me about it whenever you like.",
                         )
                         if self._debug_mode:
-                            await self._send_text(context, chat_id, f"[debug] link_saved full_id={full_id}")
+                            await self._send_text(
+                                context,
+                                chat_id,
+                                f"[debug] link_saved full_id={full_id} chars={len(combined)}",
+                            )
                     except Exception as exc:  # noqa: BLE001
                         logger.exception("Failed to ingest link: %s", exc)
                         # If extraction fails (403 paywall etc.), still save the URL as a bookmark.
                         try:
                             title_guess = text.splitlines()[0].strip()[:120] if text.strip() else url
                             link_tags = tag_text(title_guess, self._groq_client)
-                            self._memory.add_memory(
-                                f"Title: {title_guess}\nURL: {url}\n\n(Bookmark saved; content fetch failed.)",
-                                {
-                                    "source_type": "link",
-                                    "chat_id": chat_id,
-                                    "user_id": chat_id,
-                                    "url": url,
-                                    "title": title_guess,
-                                    "is_full": True,
-                                    "created_at": utc_now_iso(),
-                                    "created_at_ts": utc_now_ts(),
-                                    "tags": link_tags,
-                                    "priority_score": 0.5,
-                                    "fetch_error": str(exc)[:200],
-                                },
+                            combined = (
+                                f"Title: {title_guess}\nURL: {url}\n\n"
+                                "(Bookmark saved; content fetch failed.)"
+                            )
+                            link_meta: dict[str, Any] = {
+                                "source_type": "link",
+                                "chat_id": chat_id,
+                                "user_id": chat_id,
+                                "url": url,
+                                "title": title_guess,
+                                "created_at": utc_now_iso(),
+                                "created_at_ts": utc_now_ts(),
+                                "tags": link_tags,
+                                "priority_score": 0.5,
+                                "fetch_error": str(exc)[:200],
+                            }
+                            self._store_full_and_chunks(
+                                text=combined,
+                                base_meta=link_meta,
+                                chunk_source_type="link_chunk",
                             )
                             await self._send_text(
                                 context,
@@ -678,11 +824,37 @@ class CortexaBot:
 
         # --- QUERY ---
         if intent == INTENT_QUERY:
-            contexts = self._memory.recall_context_for_chat(text, chat_id=chat_id, k=5)
+            simple = self._is_simple_recall_query(text)
+            contexts = self._retriever.recall(query=text, chat_id=chat_id, k=(8 if simple else 5))
             # If user is asking for a simple recall, avoid LLM and return snippets + dashboard links.
-            if self._is_simple_recall_query(text) and contexts:
-                lines = ["Here's what I found in your memory:\n"]
-                for m in contexts[:3]:
+            if simple and contexts:
+                contexts = self._rerank_simple_recall(contexts, user_text=text)
+                # Show only the single best match to avoid noise.
+                m = contexts[0]
+                raw = str(m.get("raw_content") or "").strip()
+                mid = str(m.get("id") or "").strip()
+                st = str(m.get("source_type") or "")
+                if st.endswith("_chunk") or m.get("is_full") is False:
+                    await self._send_text(context, chat_id, "I couldn't find a clean main memory for that.")
+                    return
+
+                header = f"Here's what I found about \"{text.strip()[:40]}\"".rstrip() + ":\n"
+                lines = [header]
+
+                if len(raw) <= 420:
+                    lines.append(f"- {raw}")
+                else:
+                    preview = raw[:220].rstrip(".,;:!?") + "…"
+                    link = self._dashboard_memory_url(mid) if mid else None
+                    if link:
+                        lines.append(f"- {preview}\n  Open: {link}")
+                    else:
+                        lines.append(f"- {preview}")
+
+                await self._send_text(context, chat_id, "\n\n".join(lines).strip())
+                return
+
+            profile_context = self._get_latest_profile(chat_id)
                     raw = str(m.get("raw_content") or "").strip()
                     mid = str(m.get("id") or "").strip()
                     # Prefer full records if present (skip chunk children)
@@ -702,7 +874,7 @@ class CortexaBot:
                 await self._send_text(context, chat_id, "\n\n".join(lines).strip())
                 return
 
-            profile_context = self._get_latest_profile()
+            profile_context = self._get_latest_profile(chat_id)
             result = self._brains.route_query(text, contexts, profile_context=profile_context)
 
             answer = str(result.get("answer") or "").strip()
@@ -750,7 +922,11 @@ class CortexaBot:
         )
         await self._send_text(context, chat_id, self._store_confirmation(text))
         if self._debug_mode:
-            await self._send_text(context, chat_id, f"[debug] intent=INGEST_TEXT type=text tags={tags} full_id={full_id}")
+            await self._send_text(
+                context,
+                chat_id,
+                f"[debug] intent=INGEST_TEXT type=text tags={tags} full_id={full_id} len={len(text)}",
+            )
 
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
         if not update.effective_chat or not update.message or not update.message.document:
