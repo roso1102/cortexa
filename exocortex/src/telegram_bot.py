@@ -855,26 +855,6 @@ class CortexaBot:
                 return
 
             profile_context = self._get_latest_profile(chat_id)
-                    raw = str(m.get("raw_content") or "").strip()
-                    mid = str(m.get("id") or "").strip()
-                    # Prefer full records if present (skip chunk children)
-                    st = str(m.get("source_type") or "")
-                    if st.endswith("_chunk") or m.get("is_full") is False:
-                        continue
-                    if len(raw) <= 420:
-                        lines.append(f"- {raw}")
-                    else:
-                        preview = raw[:220].rstrip(".,;:!?") + "…"
-                        link = self._dashboard_memory_url(mid) if mid else None
-                        if link:
-                            lines.append(f"- {preview}\n  Open: {link}")
-                        else:
-                            lines.append(f"- {preview}")
-
-                await self._send_text(context, chat_id, "\n\n".join(lines).strip())
-                return
-
-            profile_context = self._get_latest_profile(chat_id)
             result = self._brains.route_query(text, contexts, profile_context=profile_context)
 
             answer = str(result.get("answer") or "").strip()
