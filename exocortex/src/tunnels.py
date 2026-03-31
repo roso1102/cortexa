@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from groq import Groq
+from openai import OpenAI
 
 from src.memory import MemoryManager
 from src.utils import utc_now_iso, utc_now_ts
@@ -35,8 +36,10 @@ logger = logging.getLogger(__name__)
 
 _TUNNEL_NAMER_PROMPT = """\
 You are Exocortex. Below are 3-5 short memory snippets that share a common theme.
-Give this cluster a short, human-readable tunnel name (3-6 words, title-case).
-Respond with ONLY the tunnel name and nothing else.
+
+Return ONLY valid JSON with keys:
+- name: short human-readable tunnel name (3-6 words, title-case)
+- reason: 1-2 sentence explanation of why these connect
 
 Snippets:
 {snippets}
@@ -47,7 +50,7 @@ _MAX_TUNNELS = 8               # avoid tunnel explosion
 _SNIPPET_CHARS = 200           # max chars per snippet sent to LLM
 
 
-def form_tunnels(memory: MemoryManager, groq: Groq) -> List[Dict[str, Any]]:
+def form_tunnels(memory: MemoryManager, groq: Groq, *, user_id: int, openrouter_api_key: str) -> List[Dict[str, Any]]:
     """
     Main entry point called by the scheduler weekly.
 
@@ -55,10 +58,13 @@ def form_tunnels(memory: MemoryManager, groq: Groq) -> List[Dict[str, Any]]:
     """
     logger.info("Starting tunnel formation")
     try:
-        memories = memory.fetch_all_memories(
-            exclude_source_types=["reminder", "diary_entry", "tunnel", "profile_snapshot"],
-            k=300,
+        memories = memory.query_by_filter_for_chat(
+            query_text="knowledge ideas notes memories thoughts",
+            chat_id=user_id,
+            filter_obj={"source_type": {"$nin": ["reminder", "diary_entry", "tunnel", "profile_snapshot"]}},
+            k=400,
         )
+        memories = [m for m in memories if memory.is_main_memory(m)]
     except Exception:
         logger.exception("Failed to fetch memories for tunnel formation")
         return []
@@ -115,12 +121,13 @@ def form_tunnels(memory: MemoryManager, groq: Groq) -> List[Dict[str, Any]]:
             raw = str(m.get("raw_content") or "").strip()
             snippets_for_llm.append(raw[:_SNIPPET_CHARS])
 
-        # Ask Groq to name the tunnel
-        tunnel_name = _name_tunnel(groq, tag, snippets_for_llm)
+        # Ask OpenRouter to name + explain the tunnel (better reasoning)
+        tunnel_name, tunnel_reason = _name_tunnel_openrouter(openrouter_api_key, tag, snippets_for_llm)
 
         # Store tunnel object in Pinecone
         tunnel_text = (
             f"Tunnel: {tunnel_name}\n"
+            f"Why these connect: {tunnel_reason}\n"
             f"Core tag: {tag}\n"
             f"Memories: {len(unique_mems)}\n\n"
             + "\n".join(f"- {s[:100]}" for s in snippets_for_llm[:3])
@@ -128,11 +135,13 @@ def form_tunnels(memory: MemoryManager, groq: Groq) -> List[Dict[str, Any]]:
         tunnel_metadata: Dict[str, Any] = {
             "source_type": "tunnel",
             "tunnel_name": tunnel_name,
+            "reason": tunnel_reason,
             "core_tag": tag,
             "memory_count": len(unique_mems),
             "created_at": now_iso,
             "created_at_ts": now_ts,
             "tags": ["tunnel", tag],
+            "user_id": user_id,
         }
         try:
             memory.add_memory(tunnel_text, {**tunnel_metadata, "id": tunnel_id})
@@ -159,23 +168,34 @@ def form_tunnels(memory: MemoryManager, groq: Groq) -> List[Dict[str, Any]]:
     return created_tunnels
 
 
-def _name_tunnel(groq: Groq, fallback_tag: str, snippets: List[str]) -> str:
-    """Ask Groq LLM to produce a human-readable tunnel name from snippets."""
+def _name_tunnel_openrouter(openrouter_api_key: str, fallback_tag: str, snippets: List[str]) -> tuple[str, str]:
+    """Ask OpenRouter to produce a tunnel name + reason from snippets."""
     if not snippets:
-        return fallback_tag.title()
+        return fallback_tag.title(), "Shared theme inferred from tags."
 
     snippet_block = "\n---\n".join(snippets)
     prompt = _TUNNEL_NAMER_PROMPT.format(snippets=snippet_block)
 
+    client = OpenAI(api_key=openrouter_api_key, base_url="https://openrouter.ai/api/v1")
     try:
-        resp = groq.chat.completions.create(
-            model="llama-3.1-8b-instant",
+        resp = client.chat.completions.create(
+            model="minimax/minimax-01",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=30,
+            max_tokens=220,
             temperature=0.3,
+            response_format={"type": "json_object"},
         )
-        name = (resp.choices[0].message.content or "").strip().strip('"').strip("'")
-        return name if name else fallback_tag.title()
+        raw = (resp.choices[0].message.content or "").strip()
+        import json as _json
+
+        obj = _json.loads(raw) if raw else {}
+        name = str(obj.get("name") or "").strip()
+        reason = str(obj.get("reason") or "").strip()
+        if not name:
+            name = fallback_tag.title()
+        if not reason:
+            reason = "Shared theme inferred from memory snippets."
+        return name, reason
     except Exception:
-        logger.exception("Groq tunnel naming failed, using tag as name")
-        return fallback_tag.title()
+        logger.exception("OpenRouter tunnel naming failed, using tag as name")
+        return fallback_tag.title(), "Shared theme inferred from memory snippets."

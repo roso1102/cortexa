@@ -227,7 +227,7 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
     raw_full = text or ""
     header = _header_snippet(raw_full)
 
-    # Fast-path: greetings / pleasantries — reply warmly, don't save
+    # Minimal fast-path: greetings / pleasantries — reply warmly, don't save
     if _is_chitchat(header):
         return {
             "intent": INTENT_CHITCHAT,
@@ -236,51 +236,13 @@ def classify_intent(text: str, groq_client: Groq) -> Dict[str, Any]:
             "source": "pre-check",
         }
 
-    # Fast-path: explicit "save/note/log" commands are ingestion, not reminders
+    # Minimal fast-path: explicit "save/note/log" commands are ingestion, not reminders
     t = header.strip().lower()
     if t.startswith(("save this", "save:", "note this", "note:", "log this", "journal this")) and "http" not in t:
         return {
             "intent": INTENT_INGEST_TEXT,
             "confidence": 0.9,
             "summary": "pre-check: explicit save/note instruction",
-            "source": "pre-check",
-        }
-
-    # Fast-path: commitment + time cue => reminder (even if long)
-    # Example: "i have to read this tomorrow ..." should be REMINDER.
-    if _COMMITMENT_RE.search(header or "") and _has_time_cue(raw_full):
-        return {
-            "intent": INTENT_REMINDER,
-            "confidence": 0.9,
-            "summary": "pre-check: commitment phrase with time cue",
-            "source": "pre-check",
-        }
-
-    # Fast-path: long or multiline text defaults to INGEST_TEXT (poems/brain dumps),
-    # unless it has explicit reminder structure.
-    if ("\n" in raw_full or len(raw_full) > 200) and ("remind me" not in t) and not _has_time_cue(raw_full):
-        return {
-            "intent": INTENT_INGEST_TEXT,
-            "confidence": 0.85,
-            "summary": "pre-check: long/multiline note (no explicit time cue)",
-            "source": "pre-check",
-        }
-
-    # Fast-path: obvious queries skip the LLM entirely
-    if _is_obvious_query(header):
-        return {
-            "intent": INTENT_QUERY,
-            "confidence": 0.95,
-            "summary": "pre-check: obvious query phrasing",
-            "source": "pre-check",
-        }
-
-    # Fast-path: implicit reminders (time cue present, no question)
-    if _is_implicit_reminder(header):
-        return {
-            "intent": INTENT_REMINDER,
-            "confidence": 0.85,
-            "summary": "pre-check: implicit reminder with time cue",
             "source": "pre-check",
         }
 

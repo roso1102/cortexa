@@ -150,6 +150,26 @@ class MemoryManager:
             matches.append(md)
         return matches
 
+    @staticmethod
+    def is_main_memory(md: Dict[str, Any]) -> bool:
+        """
+        Return True if this metadata represents a user-visible "main" memory.
+        Chunk children should not appear in dashboard lists, resurfacing, or tunnels.
+        """
+        st = str(md.get("source_type") or "")
+        if st.endswith("_chunk"):
+            return False
+        if md.get("is_full") is False:
+            return False
+        # Backward compatibility: older link/pdf chunks were stored as source_type=link/pdf with chunk_index>0
+        if st in {"link", "pdf"}:
+            try:
+                if int(md.get("chunk_index") or 0) != 0:
+                    return False
+            except Exception:
+                return False
+        return True
+
     def recall_context(self, query: str, k: int = 3) -> List[Dict[str, Any]]:
         vector = self._embed(query)
         res = self._index.query(vector=vector, top_k=k, include_metadata=True)
@@ -261,6 +281,21 @@ class MemoryManager:
         if exclude_source_types:
             filter_obj["source_type"] = {"$nin": exclude_source_types}
         return self.query_by_filter("memory knowledge idea note", filter_obj, k=k)
+
+    def get_old_memories_for_user(
+        self,
+        *,
+        user_id: int,
+        older_than_ts: int,
+        exclude_source_types: List[str] | None = None,
+        k: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Per-user variant of get_old_memories for scheduler resurfacing."""
+        filter_obj: Dict[str, Any] = {"created_at_ts": {"$lte": older_than_ts}, "archived": {"$ne": True}}
+        if exclude_source_types:
+            filter_obj["source_type"] = {"$nin": exclude_source_types}
+        items = self.query_by_filter_for_chat("memory knowledge idea note", chat_id=user_id, filter_obj=filter_obj, k=k)
+        return [m for m in items if self.is_main_memory(m)]
 
     def update_memory_metadata(self, memory_id: str, updates: Dict[str, Any]) -> None:
         """

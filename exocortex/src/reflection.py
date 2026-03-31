@@ -8,7 +8,7 @@ from groq import Groq
 
 from src.config import AppConfig
 from src.memory import MemoryManager
-from src.utils import utc_now_iso, utc_now_ts
+from src.utils import ist_day_range_utc_ts, ist_now, utc_now_iso, utc_now_ts
 
 
 class ReflectionService:
@@ -23,33 +23,32 @@ class ReflectionService:
         - Upcoming reminders (next 24 h)
         - 3–5 bullet LLM summary
         """
-        now = datetime.now(timezone.utc)
-        today = now.date()
-
-        contexts: List[Dict[str, Any]] = self._memory.recall_context("today's focus", k=50)
+        now_ist = ist_now()
+        start_ts, end_ts = ist_day_range_utc_ts(now_ist)
+        # Best-effort: owner/global view uses unscoped day-range query.
+        contexts: List[Dict[str, Any]] = self._memory.query_by_filter(
+            query_text="today memories",
+            filter_obj={"created_at_ts": {"$gte": start_ts, "$lt": end_ts}, "archived": {"$ne": True}},
+            k=200,
+        )
+        contexts = [m for m in contexts if self._memory.is_main_memory(m)]
 
         todays_texts: List[str] = []
         type_counter: Counter = Counter()
         tag_counter: Counter = Counter()
 
         for m in contexts:
-            created_at = m.get("created_at")
             raw = m.get("raw_content")
             source_type = m.get("source_type", "text")
-            if not created_at or not raw:
+            if not raw:
                 continue
-            try:
-                dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            except Exception:
-                continue
-            if dt.date() == today:
-                todays_texts.append(raw)
-                type_counter[source_type] += 1
-                for tag in (m.get("tags") or []):
-                    tag_counter[str(tag)] += 1
+            todays_texts.append(raw)
+            type_counter[source_type] += 1
+            for tag in (m.get("tags") or []):
+                tag_counter[str(tag)] += 1
 
         # --- Upcoming reminders (next 24 h) ---
-        upcoming_reminders = self._get_upcoming_reminders(now)
+        upcoming_reminders = self._get_upcoming_reminders(datetime.now(timezone.utc))
 
         if not todays_texts and not upcoming_reminders:
             return "Nothing was captured today and no upcoming reminders."
@@ -107,33 +106,32 @@ class ReflectionService:
         Per-user variant of summarize_today, scoped by user_id.
         Used by the dashboard so each user sees only their own day.
         """
-        now = datetime.now(timezone.utc)
-        today = now.date()
-
-        contexts: List[Dict[str, Any]] = self._memory.recall_context_for_chat("today's focus", chat_id=user_id, k=50)
+        now_ist = ist_now()
+        start_ts, end_ts = ist_day_range_utc_ts(now_ist)
+        contexts: List[Dict[str, Any]] = self._memory.query_by_filter_for_chat(
+            query_text="today memories",
+            chat_id=user_id,
+            filter_obj={"created_at_ts": {"$gte": start_ts, "$lt": end_ts}, "archived": {"$ne": True}},
+            k=400,
+        )
+        contexts = [m for m in contexts if self._memory.is_main_memory(m)]
 
         todays_texts: List[str] = []
         type_counter: Counter = Counter()
         tag_counter: Counter = Counter()
 
         for m in contexts:
-            created_at = m.get("created_at")
             raw = m.get("raw_content")
             source_type = m.get("source_type", "text")
-            if not created_at or not raw:
+            if not raw:
                 continue
-            try:
-                dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            except Exception:
-                continue
-            if dt.date() == today:
-                todays_texts.append(raw)
-                type_counter[source_type] += 1
-                for tag in (m.get("tags") or []):
-                    tag_counter[str(tag)] += 1
+            todays_texts.append(raw)
+            type_counter[source_type] += 1
+            for tag in (m.get("tags") or []):
+                tag_counter[str(tag)] += 1
 
         # --- Upcoming reminders (next 24 h) ---
-        upcoming_reminders = self._get_upcoming_reminders(now, user_id=user_id)
+        upcoming_reminders = self._get_upcoming_reminders(datetime.now(timezone.utc), user_id=user_id)
 
         if not todays_texts and not upcoming_reminders:
             return "Nothing was captured today and no upcoming reminders."

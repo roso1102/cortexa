@@ -613,24 +613,26 @@ class CortexaBot:
 
                         header = f"Title: {extracted.title or extracted.url}\nURL: {extracted.url}\n\n"
                         combined = header + extracted.text.strip()
-                        chunks = chunk_text(combined)
-                        chunks = chunks[:30]
+                        chunks_for_tags = chunk_text(combined)[:1]
                         # Tag from the first chunk (most representative content)
-                        link_tags = tag_text(chunks[0] if chunks else extracted.title, self._groq_client)
-                        for idx, chunk in enumerate(chunks):
-                            link_meta: dict[str, Any] = {
-                                "source_type": "link",
-                                "chat_id": chat_id,
-                                "user_id": chat_id,
-                                "url": extracted.url,
-                                "title": extracted.title or extracted.url,
-                                "chunk_index": idx,
-                                "created_at": utc_now_iso(),
-                                "created_at_ts": utc_now_ts(),
-                                "tags": link_tags,
-                                "priority_score": 0.5,
-                            }
-                            self._memory.add_memory(chunk, link_meta)
+                        link_tags = tag_text(chunks_for_tags[0] if chunks_for_tags else extracted.title, self._groq_client)
+
+                        link_meta: dict[str, Any] = {
+                            "source_type": "link",
+                            "chat_id": chat_id,
+                            "user_id": chat_id,
+                            "url": extracted.url,
+                            "title": extracted.title or extracted.url,
+                            "created_at": utc_now_iso(),
+                            "created_at_ts": utc_now_ts(),
+                            "tags": link_tags,
+                            "priority_score": 0.5,
+                        }
+                        full_id = self._store_full_and_chunks(
+                            text=combined,
+                            base_meta=link_meta,
+                            chunk_source_type="link_chunk",
+                        )
 
                         title_display = extracted.title or extracted.url
                         await self._send_text(
@@ -640,7 +642,7 @@ class CortexaBot:
                             f"You can ask me about it whenever you like.",
                         )
                         if self._debug_mode:
-                            await self._send_text(context, chat_id, f"[debug] link_saved chunks={len(chunks)}")
+                            await self._send_text(context, chat_id, f"[debug] link_saved full_id={full_id}")
                     except Exception as exc:  # noqa: BLE001
                         logger.exception("Failed to ingest link: %s", exc)
                         # If extraction fails (403 paywall etc.), still save the URL as a bookmark.
@@ -655,7 +657,7 @@ class CortexaBot:
                                     "user_id": chat_id,
                                     "url": url,
                                     "title": title_guess,
-                                    "chunk_index": 0,
+                                    "is_full": True,
                                     "created_at": utc_now_iso(),
                                     "created_at_ts": utc_now_ts(),
                                     "tags": link_tags,
@@ -684,7 +686,8 @@ class CortexaBot:
                     raw = str(m.get("raw_content") or "").strip()
                     mid = str(m.get("id") or "").strip()
                     # Prefer full records if present (skip chunk children)
-                    if m.get("source_type") in {"text_chunk", "reminder_chunk"}:
+                    st = str(m.get("source_type") or "")
+                    if st.endswith("_chunk") or m.get("is_full") is False:
                         continue
                     if len(raw) <= 420:
                         lines.append(f"- {raw}")
@@ -812,27 +815,32 @@ class CortexaBot:
             # Tag from the first chunk (representative of the document)
             pdf_tags = tag_text(chunks[0] if chunks else document.file_name, self._groq_client)
 
-            for idx, chunk in enumerate(chunks):
-                pdf_meta: dict[str, Any] = {
-                    "source_type": "pdf",
-                    "chat_id": chat_id,
-                    "user_id": chat_id,
-                    "file_name": document.file_name,
-                    "chunk_index": idx,
-                    "created_at": utc_now_iso(),
-                    "created_at_ts": utc_now_ts(),
-                    "tags": pdf_tags,
-                    "priority_score": 0.5,
-                }
-                self._memory.add_memory(chunk, pdf_meta)
+            # Store a canonical full PDF record + optional chunks so the dashboard
+            # shows the main item (and hides chunk children).
+            chunk_count = min(len(chunks), 30)
+            pdf_meta: dict[str, Any] = {
+                "source_type": "pdf",
+                "chat_id": chat_id,
+                "user_id": chat_id,
+                "file_name": document.file_name,
+                "created_at": utc_now_iso(),
+                "created_at_ts": utc_now_ts(),
+                "tags": pdf_tags,
+                "priority_score": 0.5,
+            }
+            full_id = self._store_full_and_chunks(
+                text=full_text,
+                base_meta=pdf_meta,
+                chunk_source_type="pdf_chunk",
+            )
 
             await self._send_text(
                 context,
                 chat_id=chat_id,
-                text=f'Got it. I\'ve saved "{document.file_name}" into your memory ({len(chunks)} chunks). You can ask me about it anytime.',
+                text=f'Got it. I\'ve saved "{document.file_name}" into your memory ({chunk_count} chunks). You can ask me about it anytime.',
             )
             if self._debug_mode:
-                await self._send_text(context, chat_id, f"[debug] pdf_saved tags={pdf_tags}")
+                await self._send_text(context, chat_id, f"[debug] pdf_saved full_id={full_id} tags={pdf_tags}")
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to process PDF: %s", exc)
             await self._send_text(context, chat_id, "Sorry, I couldn't process that PDF.")

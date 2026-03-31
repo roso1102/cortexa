@@ -103,9 +103,10 @@ def create_api_blueprint(
         if source_type:
             filter_obj["source_type"] = {"$eq": source_type}
 
-        # Pinecone metadata filtering doesn't support "contains" on arrays in a portable way.
-        # We'll fetch a larger window and filter tags in Python.
-        top_k = min(200, per_page * page)
+        # Pinecone requires a query vector; list results are approximate.
+        # We fetch a larger candidate window so pagination + main-only filtering
+        # still returns the expected number of items.
+        top_k = min(1000, per_page * page * 10)
         query_text = q or "memories notes links pdf reminders"
         items = memory.query_by_filter(query_text=query_text, filter_obj=filter_obj, k=top_k)
 
@@ -116,6 +117,28 @@ def create_api_blueprint(
                 if tag in tags:
                     filtered.append(m)
             items = filtered
+
+        # Dashboard should show only "main" memories (not chunk children).
+        # Storage model:
+        # - text/reminder full records: source_type="text"/"reminder", is_full=True
+        # - text/reminder chunk children: source_type="text_chunk"/"reminder_chunk"
+        # - link/pdf chunk children: source_type="link"/"pdf" with chunk_index>0 (old) or
+        #   source_type="link_chunk"/"pdf_chunk" (new)
+        cleaned: list[Dict[str, Any]] = []
+        for m in items:
+            st = str(m.get("source_type") or "")
+            if st.endswith("_chunk"):
+                continue
+            if m.get("is_full") is False:
+                continue
+            if st in {"link", "pdf"}:
+                try:
+                    if int(m.get("chunk_index") or 0) != 0:
+                        continue
+                except Exception:
+                    continue
+            cleaned.append(m)
+        items = cleaned
 
         total = len(items)
         start = (page - 1) * per_page

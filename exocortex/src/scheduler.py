@@ -76,31 +76,34 @@ class ReminderScheduler:
             time.sleep(self._poll_interval)
 
     def _tick(self) -> None:
-        now = datetime.now(timezone.utc)
-        now_ts = int(now.timestamp())
+        # All scheduler "clock" logic runs in IST for user expectations.
+        from src.utils import ist_now
+
+        now_ist = ist_now()
+        now_ts = int(now_ist.astimezone(timezone.utc).timestamp())
 
         # --- fire due reminders ---
         self._fire_due_reminders(now_ts)
 
         # --- optional daily digest ---
         if self._daily_digest_time:
-            self._maybe_send_daily_digest(now)
+            self._maybe_send_daily_digest(now_ist)
 
         # --- proactive resurfacing (daily) ---
         if self._resurface_time and self._owner_chat_id:
-            self._maybe_resurface(now)
+            self._maybe_resurface(now_ist)
 
         # --- weekly diary (Sundays) ---
         if self._weekly_diary_time and self._owner_chat_id:
-            self._maybe_send_weekly_diary(now)
+            self._maybe_send_weekly_diary(now_ist)
 
         # --- weekly tunnel formation (Sundays, same window as diary) ---
         if self._weekly_diary_time and self._groq:
-            self._maybe_form_tunnels(now)
+            self._maybe_form_tunnels(now_ist)
 
         # --- monthly personal profile (1st of month) ---
         if self._weekly_diary_time and self._owner_chat_id:
-            self._maybe_send_profile(now)
+            self._maybe_send_profile(now_ist)
 
     # ------------------------------------------------------------------
     # Reminder firing
@@ -166,7 +169,7 @@ class ReminderScheduler:
             return  # already sent today
 
         try:
-            summary = self._reflection.summarize_today()
+            summary = self._reflection.summarize_today_for_user(self._owner_chat_id)
             self._send_telegram(self._owner_chat_id, f"Daily digest:\n\n{summary}")
             self._digest_sent_date = today_str
             logger.info("Daily digest sent for %s", today_str)
@@ -189,9 +192,10 @@ class ReminderScheduler:
             return
 
         try:
-            cutoff_ts = int((now - timedelta(days=7)).timestamp())  # production: change to days=7
-            now_ts = int(now.timestamp())
-            old_memories = self._memory.get_old_memories(
+            cutoff_ts = int((now - timedelta(days=7)).astimezone(timezone.utc).timestamp())
+            now_ts = int(now.astimezone(timezone.utc).timestamp())
+            old_memories = self._memory.get_old_memories_for_user(
+                user_id=self._owner_chat_id,
                 older_than_ts=cutoff_ts,
                 exclude_source_types=["reminder", "diary_entry", "tunnel", "profile_snapshot"],
                 k=50,
@@ -317,7 +321,14 @@ class ReminderScheduler:
 
         try:
             from src.tunnels import form_tunnels
-            tunnels = form_tunnels(self._memory, self._groq)  # type: ignore[arg-type]
+            # Tunnels are formed per-user (owner for now) and named via OpenRouter for better reasoning.
+            openrouter_key = (getattr(self._memory, "_config", None) and getattr(self._memory._config, "openrouter_api_key", "")) or ""  # type: ignore[attr-defined]
+            tunnels = form_tunnels(
+                self._memory,
+                self._groq,  # type: ignore[arg-type]
+                user_id=self._owner_chat_id,
+                openrouter_api_key=openrouter_key,
+            )
             if tunnels:
                 names = ", ".join(t.get("tunnel_name", "?") for t in tunnels[:5])
                 self._send_telegram(
