@@ -398,6 +398,86 @@ class CortexaBot:
         if self._debug_mode:
             await self._send_text(context, chat_id, f"[debug] poems_list count={len(poem_ids)}")  # type: ignore[arg-type]
 
+    async def _handle_list_memories(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,  # type: ignore[type-arg]
+        chat_id: int,
+        *,
+        kind: str | None = None,
+        topic: str | None = None,
+        limit: int = 8,
+    ) -> None:
+        """
+        Generic deterministic memory listing with optional kind/topic filters.
+        Returns dashboard links when available.
+        """
+        query_text_parts = ["memory note saved"]
+        if kind:
+            query_text_parts.append(kind)
+        if topic:
+            query_text_parts.append(topic)
+        candidates = self._memory.query_by_filter_for_chat(
+            query_text=" ".join(query_text_parts),
+            chat_id=chat_id,
+            filter_obj={},
+            k=60,
+        )
+
+        kind_l = (kind or "").strip().lower()
+        topic_tokens = re.findall(r"[a-z0-9]+", (topic or "").lower())
+
+        matches: list[dict[str, Any]] = []
+        for m in candidates:
+            source_type = str(m.get("source_type") or "")
+            if source_type.endswith("_chunk") or m.get("is_full") is False:
+                continue
+            text_blob = " ".join(
+                [
+                    str(m.get("title") or "").lower(),
+                    str(m.get("raw_content") or "").lower(),
+                    " ".join([str(t).lower() for t in (m.get("tags") or [])]),
+                    source_type.lower(),
+                ]
+            )
+            if kind_l and kind_l not in text_blob:
+                continue
+            if topic_tokens and not any(tok in text_blob for tok in topic_tokens[:8]):
+                continue
+            matches.append(m)
+            if len(matches) >= max(1, min(limit, 12)):
+                break
+
+        if not matches:
+            hint_parts = []
+            if kind:
+                hint_parts.append(f"type: {kind}")
+            if topic:
+                hint_parts.append(f"topic: {topic}")
+            hint = f" ({', '.join(hint_parts)})" if hint_parts else ""
+            await self._send_text(context, chat_id, f"I couldn't find saved memories{hint}.")
+            if self._debug_mode:
+                await self._send_text(context, chat_id, f"[debug] memories_list count=0 kind={kind_l or '-'} topic={topic or '-'}")
+            return
+
+        lines = ["Here are the saved memories I found:\n"]
+        for idx, m in enumerate(matches, start=1):
+            mem_id = str(m.get("id") or "").strip()
+            if not mem_id:
+                continue
+            raw = str(m.get("raw_content") or "").strip()
+            title = str(m.get("title") or "").strip()
+            if not title:
+                title = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")[:80] or f"Memory {idx}"
+            dash_url = self._dashboard_memory_url(mem_id)
+            if dash_url:
+                lines.append(f"{idx}. {title}\n   Open: {dash_url}")
+            else:
+                lines.append(f"{idx}. {title}")
+
+        await self._send_text(context, chat_id, "\n".join(lines).strip())
+        if self._debug_mode:
+            await self._send_text(context, chat_id, f"[debug] memories_list count={len(matches)} kind={kind_l or '-'} topic={topic or '-'}")
+
     def _dashboard_memory_url(self, memory_id: str) -> str | None:
         base = (self._config.dashboard_public_url or "").strip()
         if not base:
@@ -623,13 +703,14 @@ class CortexaBot:
                     await self._handle_links_today(context, chat_id)
                     return
                 if lt == LIST_MEMORIES:
-                    # Defer to normal recall path by asking a structured query.
-                    # Keeps behavior consistent with existing hybrid retrieval.
-                    query = "List my recent saved memories."
-                    contexts = self._retriever.recall(query=query, chat_id=chat_id, k=6)
-                    profile_context = self._get_latest_profile(chat_id)
-                    result = self._brains.route_query(query, contexts, profile_context=profile_context, source_refs=[])
-                    await self._send_text(context, chat_id, str(result.get("answer") or "").strip() or "I couldn't find any memories yet.")
+                    kind = str(routed.args.get("kind") or "").strip() or None
+                    topic = str(routed.args.get("topic") or "").strip() or None
+                    limit_arg = routed.args.get("limit")
+                    try:
+                        limit = int(limit_arg) if limit_arg is not None else 8
+                    except Exception:
+                        limit = 8
+                    await self._handle_list_memories(context, chat_id, kind=kind, topic=topic, limit=limit)
                     return
 
             # DELETE

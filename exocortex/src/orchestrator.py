@@ -98,7 +98,7 @@ Action guidance:
 - ANSWER_QUERY: when user is asking a question (what/how/why/when/where/who, ends with '?', or a request for help/suggestions).
   args: { query: string }
 - LIST: when user is asking to list previously saved things.
-  args: { list_type: one of poems|links|memories }
+  args: { list_type: one of poems|links|memories, kind?: string, topic?: string, limit?: number }
 - SET_REMINDER: when user wants a reminder at a specific time/date.
   args: { text: string }
 - DELETE: when user wants to delete something they saved.
@@ -110,6 +110,7 @@ Rules:
 - If there is a URL and no explicit question, prefer SAVE_LINK.
 - Messages starting with what/how/why/when/where/who are almost always ANSWER_QUERY.
 - For poem listing requests like 'what poem did i save', prefer LIST with list_type='poems'.
+- For generic recall prompts like "what limerick/story/news did I save about X", prefer LIST with list_type='memories' and fill kind/topic when possible.
 - Only choose SET_REMINDER if the message has an explicit time cue (tomorrow/tonight/at 6pm/in 2 hours/etc).
 - If confidence < 0.55, choose CLARIFY and ask a single short question.
 
@@ -143,6 +144,13 @@ def route_action(text: str, groq_client: Groq) -> RoutedAction:
     # Fast-path: explicit save commands are save-text
     if t.startswith(("save this", "save:", "note this", "note:", "log this", "journal this")) and "http" not in t:
         return RoutedAction(action=ACTION_SAVE_TEXT, confidence=0.9, reason="pre-check: explicit save", args={"text": raw_full})
+
+    # Fast-path: generic memory listing (with optional kind/topic extraction).
+    if _is_list_memory_query(t):
+        args = _extract_list_memory_filters(t)
+        if args.get("kind") == "poem":
+            args = {"list_type": LIST_POEMS}
+        return RoutedAction(action=ACTION_LIST, confidence=0.95, reason="pre-check: memory listing request", args=args)
 
     # Fast-path: obvious queries
     if _is_obvious_query(header):
@@ -251,6 +259,14 @@ _QUERY_SUBSTRINGS = (
     "what about", "can you tell",
     "step plan", "validation plan", "give me a plan",
 )
+_LIST_MEMORY_CUES = (
+    "did i save",
+    "i saved",
+    "show my",
+    "list my",
+    "what did i save",
+    "which did i save",
+)
 
 # Time-of-day / relative-time cues that make a message an implicit reminder.
 # "am" / "pm" are matched only when preceded by a digit (e.g. "9am", "10pm")
@@ -315,12 +331,55 @@ def _is_list_links_query(text: str) -> bool:
     return any(cue in t for cue in _LIST_LINK_CUES)
 
 
+def _extract_list_memory_filters(text: str) -> dict[str, str]:
+    t = (text or "").strip().lower()
+    args: dict[str, str] = {"list_type": LIST_MEMORIES}
+
+    kind_match = re.search(
+        r"\b(poem|poems|limerick|limericks|short story|short stories|story|stories|news|article|articles|note|notes|memory|memories)\b",
+        t,
+    )
+    if kind_match:
+        kind = kind_match.group(1).strip()
+        kind_map = {
+            "poems": "poem",
+            "limericks": "limerick",
+            "short stories": "short story",
+            "stories": "story",
+            "articles": "article",
+            "notes": "note",
+            "memories": "memory",
+        }
+        args["kind"] = kind_map.get(kind, kind)
+
+    about_match = re.search(r"\babout\s+(.+)$", t)
+    if about_match:
+        topic = about_match.group(1).strip(" .?!,")
+        if topic:
+            args["topic"] = topic
+
+    return args
+
+
+def _is_list_memory_query(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if _is_list_links_query(t):
+        return False
+    if any(cue in t for cue in _LIST_MEMORY_CUES):
+        return True
+    return bool(re.search(r"\bwhat\s+(poem|limerick|short story|story|news|article|note|memory)\b", t))
+
+
 def _is_obvious_query(text: str) -> bool:
     """Fast pre-check: return True if the message is unambiguously a query."""
     t = text.strip().lower()
 
     # List-links requests should not be short-circuited to QUERY
     if _is_list_links_query(t):
+        return False
+    if _is_list_memory_query(t):
         return False
 
     if t.endswith("?"):
