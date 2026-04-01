@@ -19,6 +19,22 @@ INTENT_DELETE      = "DELETE"
 INTENT_CHITCHAT    = "CHITCHAT"
 INTENT_UNKNOWN     = "UNKNOWN"
 
+# Action router schema (Option B router upgrade)
+from src.action_schema import (  # noqa: E402
+    ACTION_ANSWER_QUERY,
+    ACTION_CLARIFY,
+    ACTION_DELETE,
+    ACTION_LIST,
+    ACTION_SAVE_LINK,
+    ACTION_SAVE_TEXT,
+    ACTION_SET_REMINDER,
+    LIST_LINKS,
+    LIST_MEMORIES,
+    LIST_POEMS,
+    RoutedAction,
+    parse_routed_action,
+)
+
 _CLASSIFICATION_SCHEMA = """\
 You are an intent classifier for a personal cognitive memory system called cortexa.
 
@@ -63,6 +79,142 @@ Examples:
 Key rule: If a message mentions a person AND a time word (this evening, tonight, tomorrow, at Xpm, next week, in X hours/minutes), classify it as REMINDER even without the word "remind".
 """
 
+
+_ACTION_ROUTER_SCHEMA = """\
+You are an action router for a personal cognitive memory system called cortexa.
+
+Given the user's message, choose the single best next action.
+Return ONLY valid JSON with keys:
+- action: one of SAVE_TEXT, SAVE_LINK, ANSWER_QUERY, LIST, SET_REMINDER, DELETE, CLARIFY
+- confidence: float 0.0-1.0
+- reason: short 1-line explanation
+- args: object with action-specific fields
+
+Action guidance:
+- SAVE_LINK: when message contains a URL and the user is sharing it to save.
+  args: { urls: [ ... ] } (1-3 urls)
+- SAVE_TEXT: when user is sharing a note/poem/idea to remember.
+  args: { text: string }
+- ANSWER_QUERY: when user is asking a question (what/how/why/when/where/who, ends with '?', or a request for help/suggestions).
+  args: { query: string }
+- LIST: when user is asking to list previously saved things.
+  args: { list_type: one of poems|links|memories }
+- SET_REMINDER: when user wants a reminder at a specific time/date.
+  args: { text: string }
+- DELETE: when user wants to delete something they saved.
+  args: { target: string } (e.g. 'last', an id, or a natural-language reference)
+- CLARIFY: when you are not confident whether the user wants to save vs ask.
+  args: { question: string }
+
+Rules:
+- If there is a URL and no explicit question, prefer SAVE_LINK.
+- Messages starting with what/how/why/when/where/who are almost always ANSWER_QUERY.
+- For poem listing requests like 'what poem did i save', prefer LIST with list_type='poems'.
+- Only choose SET_REMINDER if the message has an explicit time cue (tomorrow/tonight/at 6pm/in 2 hours/etc).
+- If confidence < 0.55, choose CLARIFY and ask a single short question.
+
+Only return raw JSON. No prose, no markdown.
+"""
+
+
+def route_action(text: str, groq_client: Groq) -> RoutedAction:
+    """
+    Route a user message to a single executable action (tool-calling style).
+    This replaces brittle phrase handlers in telegram_bot.py.
+    """
+    raw_full = text or ""
+    header = _header_snippet(raw_full)
+
+    # Fast-path: greetings / pleasantries — CLARIFY/answer in bot layer
+    if _is_chitchat(header):
+        return RoutedAction(action=ACTION_CLARIFY, confidence=1.0, reason="pre-check: chitchat", args={"question": "Hey — what do you want to do: save something, or ask something?"})
+
+    # Fast-path: URLs present -> save link unless it's clearly a question about the URL
+    t = header.strip().lower()
+    if ("http://" in t or "https://" in t) and not t.endswith("?"):
+        urls = re.findall(r"https?://\S+", header)[:3]
+        return RoutedAction(
+            action=ACTION_SAVE_LINK,
+            confidence=0.85,
+            reason="pre-check: url present",
+            args={"urls": urls},
+        )
+
+    # Fast-path: explicit save commands are save-text
+    if t.startswith(("save this", "save:", "note this", "note:", "log this", "journal this")) and "http" not in t:
+        return RoutedAction(action=ACTION_SAVE_TEXT, confidence=0.9, reason="pre-check: explicit save", args={"text": raw_full})
+
+    # Fast-path: obvious queries
+    if _is_obvious_query(header):
+        return RoutedAction(action=ACTION_ANSWER_QUERY, confidence=0.9, reason="pre-check: obvious query phrasing", args={"query": raw_full})
+
+    # Fast-path: implicit reminders (short + time cue)
+    if _is_implicit_reminder(header) or ("remind me" in t and _has_time_cue(raw_full)):
+        return RoutedAction(action=ACTION_SET_REMINDER, confidence=0.8, reason="pre-check: reminder cue", args={"text": raw_full})
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": _ACTION_ROUTER_SCHEMA},
+                {"role": "user", "content": header},
+            ],
+            max_tokens=220,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        raw = (response.choices[0].message.content or "{}").strip()
+        parsed = parse_routed_action(raw)
+        if not parsed:
+            raise ValueError("invalid router json")
+
+        # Normalize/validate actions
+        allowed = {
+            ACTION_SAVE_TEXT,
+            ACTION_SAVE_LINK,
+            ACTION_ANSWER_QUERY,
+            ACTION_LIST,
+            ACTION_SET_REMINDER,
+            ACTION_DELETE,
+            ACTION_CLARIFY,
+        }
+        if parsed.action not in allowed:
+            return RoutedAction(action=ACTION_CLARIFY, confidence=0.4, reason="validator: unknown action", args={"question": "Do you want me to save this, or answer it?"})
+
+        # Reminder validator: require time cue
+        if parsed.action == ACTION_SET_REMINDER and not _has_time_cue(raw_full):
+            return RoutedAction(action=ACTION_SAVE_TEXT, confidence=0.6, reason="validator: reminder requires time cue", args={"text": raw_full})
+
+        # LIST validator
+        if parsed.action == ACTION_LIST:
+            lt = str(parsed.args.get("list_type") or "").strip().lower()
+            if lt not in {LIST_POEMS, LIST_LINKS, LIST_MEMORIES}:
+                # default to memories if unspecified
+                parsed = RoutedAction(action=ACTION_LIST, confidence=parsed.confidence, reason=parsed.reason or "validator: default list_type", args={"list_type": LIST_MEMORIES})
+
+        # For confidence low, force CLARIFY
+        if parsed.confidence < 0.55 and parsed.action != ACTION_CLARIFY:
+            return RoutedAction(action=ACTION_CLARIFY, confidence=parsed.confidence, reason="low confidence", args={"question": "Do you want me to save this, or answer it?"})
+
+        return parsed
+    except Exception as exc:
+        logger.warning("LLM action router failed (%s), falling back to intent classifier.", exc)
+        # Fallback to existing intent classifier
+        legacy = classify_intent(text, groq_client)
+        intent = legacy.get("intent")
+        if intent == INTENT_QUERY:
+            return RoutedAction(action=ACTION_ANSWER_QUERY, confidence=float(legacy.get("confidence") or 0.6), reason="fallback: legacy intent QUERY", args={"query": raw_full})
+        if intent == INTENT_LIST_LINKS:
+            return RoutedAction(action=ACTION_LIST, confidence=float(legacy.get("confidence") or 0.6), reason="fallback: legacy intent LIST_LINKS", args={"list_type": LIST_LINKS})
+        if intent == INTENT_REMINDER:
+            return RoutedAction(action=ACTION_SET_REMINDER, confidence=float(legacy.get("confidence") or 0.6), reason="fallback: legacy intent REMINDER", args={"text": raw_full})
+        if intent == INTENT_DELETE:
+            return RoutedAction(action=ACTION_DELETE, confidence=float(legacy.get("confidence") or 0.6), reason="fallback: legacy intent DELETE", args={"target": raw_full})
+        if intent == INTENT_INGEST_LINK:
+            urls = re.findall(r"https?://\\S+", raw_full)
+            return RoutedAction(action=ACTION_SAVE_LINK, confidence=float(legacy.get("confidence") or 0.6), reason="fallback: legacy intent INGEST_LINK", args={"urls": urls[:3]})
+        # default
+        return RoutedAction(action=ACTION_SAVE_TEXT, confidence=float(legacy.get("confidence") or 0.6), reason="fallback: legacy intent INGEST_TEXT", args={"text": raw_full})
 
 # Salutations / small-talk phrases — should get a friendly reply, not be saved
 _CHITCHAT_PHRASES = frozenset({

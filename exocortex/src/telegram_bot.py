@@ -21,7 +21,28 @@ from src.config import AppConfig
 from src.brains import BrainsRouter
 from src.memory import MemoryManager
 from src.reflection import ReflectionService
-from src.orchestrator import classify_intent, INTENT_QUERY, INTENT_INGEST_TEXT, INTENT_INGEST_LINK, INTENT_REMINDER, INTENT_LIST_LINKS, INTENT_DELETE, INTENT_CHITCHAT
+from src.orchestrator import (
+    classify_intent,
+    route_action,
+    INTENT_CHITCHAT,
+    INTENT_DELETE,
+    INTENT_INGEST_LINK,
+    INTENT_QUERY,
+    INTENT_REMINDER,
+    INTENT_LIST_LINKS,
+)
+from src.action_schema import (
+    ACTION_ANSWER_QUERY,
+    ACTION_CLARIFY,
+    ACTION_DELETE,
+    ACTION_LIST,
+    ACTION_SAVE_LINK,
+    ACTION_SAVE_TEXT,
+    ACTION_SET_REMINDER,
+    LIST_LINKS,
+    LIST_MEMORIES,
+    LIST_POEMS,
+)
 from datetime import datetime, timedelta, timezone
 
 from src.utils import chunk_text, utc_now_iso, utc_now_ts
@@ -561,7 +582,135 @@ class CortexaBot:
             await self._send_text(context, chat_id, "Sorry, this is a private memory system.")
             return
 
-        # --- Classify intent via LLM (with keyword fallback) ---
+        use_action_router = os.getenv("ACTION_ROUTER", "").strip().lower() in {"1", "true", "yes", "on"}
+
+        # --- Option B: Action router (feature-flagged) ---
+        if use_action_router:
+            routed = route_action(text, self._groq_client)
+            if self._debug_mode:
+                await self._send_text(
+                    context,
+                    chat_id,
+                    f"[debug] action={routed.action} confidence={routed.confidence:.2f} reason={routed.reason} args={routed.args}",
+                )
+
+            # CLARIFY
+            if routed.action == ACTION_CLARIFY:
+                q = str(routed.args.get("question") or "").strip() or "Do you want me to save this, or answer it?"
+                await self._send_text(context, chat_id, q)
+                return
+
+            # LIST (poems/links/memories)
+            if routed.action == ACTION_LIST:
+                lt = str(routed.args.get("list_type") or "").strip().lower()
+                if lt == LIST_POEMS:
+                    await self._handle_list_poems(context, chat_id)
+                    return
+                if lt == LIST_LINKS:
+                    await self._handle_links_today(context, chat_id)
+                    return
+                if lt == LIST_MEMORIES:
+                    # Defer to normal recall path by asking a structured query.
+                    # Keeps behavior consistent with existing hybrid retrieval.
+                    query = "List my recent saved memories."
+                    contexts = self._retriever.recall(query=query, chat_id=chat_id, k=6)
+                    profile_context = self._get_latest_profile(chat_id)
+                    result = self._brains.route_query(query, contexts, profile_context=profile_context, source_refs=[])
+                    await self._send_text(context, chat_id, str(result.get("answer") or "").strip() or "I couldn't find any memories yet.")
+                    return
+
+            # DELETE
+            if routed.action == ACTION_DELETE:
+                target = str(routed.args.get("target") or "").strip() or text
+                # Reuse existing delete logic by overwriting text and falling through
+                text = target
+
+            # SET_REMINDER
+            if routed.action == ACTION_SET_REMINDER:
+                reminder = parse_reminder_llm(text, self._groq_client)
+                if reminder:
+                    meta = reminder_to_metadata(reminder, chat_id=chat_id)
+                    base_meta = {**meta, "source_type": "reminder", "user_id": chat_id}
+                    full_id = self._store_full_and_chunks(
+                        text=reminder.text,
+                        base_meta=base_meta,
+                        chunk_source_type="reminder_chunk",
+                    )
+                    await self._send_text(
+                        context,
+                        chat_id,
+                        f'Reminder set for {reminder.due_at_iso[:16].replace("T", " ")} UTC. '
+                        f'I\'ll remind you: "{reminder.text}".',
+                    )
+                    if self._debug_mode:
+                        await self._send_text(context, chat_id, f"[debug] reminder_saved full_id={full_id} due={reminder.due_at_iso}")
+                    return
+
+            # SAVE_LINK
+            if routed.action == ACTION_SAVE_LINK:
+                urls = routed.args.get("urls")
+                if not isinstance(urls, list):
+                    urls = extract_urls(text)
+                # Reuse existing ingest-link branch via setting urls local var below.
+            # SAVE_TEXT
+            if routed.action == ACTION_SAVE_TEXT:
+                # proceed to ingest-text default at bottom
+                pass
+            # ANSWER_QUERY
+            if routed.action == ACTION_ANSWER_QUERY:
+                query = str(routed.args.get("query") or "").strip() or text
+                simple = self._is_simple_recall_query(query)
+                contexts = self._retriever.recall(query=query, chat_id=chat_id, k=(8 if simple else 5))
+                if simple and contexts:
+                    contexts = self._rerank_simple_recall(contexts, user_text=query)
+                    m = contexts[0]
+                    raw = str(m.get("raw_content") or "").strip()
+                    mid = str(m.get("id") or "").strip()
+                    st = str(m.get("source_type") or "")
+                    if st.endswith("_chunk") or m.get("is_full") is False:
+                        await self._send_text(context, chat_id, "I couldn't find a clean main memory for that.")
+                        return
+                    header = f"Here's what I found about \"{query.strip()[:40]}\"".rstrip() + ":\n"
+                    lines = [header]
+                    if len(raw) <= 420:
+                        lines.append(f"- {raw}")
+                    else:
+                        preview = raw[:220].rstrip(".,;:!?") + "…"
+                        link = self._dashboard_memory_url(mid) if mid else None
+                        if link:
+                            lines.append(f"- {preview}\n  Open: {link}")
+                        else:
+                            lines.append(f"- {preview}")
+                    await self._send_text(context, chat_id, "\n\n".join(lines).strip())
+                    return
+
+                profile_context = self._get_latest_profile(chat_id)
+                # Let brains filter saved-link refs, or override with [] to suppress.
+                result = self._brains.route_query(query, contexts, profile_context=profile_context)
+                answer = str(result.get("answer") or "").strip()
+                if contexts:
+                    top = contexts[0]
+                    top_id = str(top.get("id") or "").strip()
+                    dash_url = self._dashboard_memory_url(top_id) if top_id else None
+                else:
+                    dash_url = None
+
+                if len(answer) <= 700 or not dash_url:
+                    await self._send_text(context, chat_id, answer)
+                else:
+                    preview = answer[:520].rstrip(".,;:!?") + "…"
+                    keyboard = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("Open in dashboard", url=dash_url)]]
+                    )
+                    await context.bot.send_message(chat_id=chat_id, text=preview, reply_markup=keyboard)
+
+                if self._debug_mode:
+                    await self._send_text(context, chat_id, f"[debug] action=ANSWER_QUERY retrieved={len(contexts)} model={result.get('model')}")
+                return
+
+            # If we reach here, fall through to existing delete/link/text branches below.
+
+        # --- Legacy intent classifier path (default / fallback) ---
         intent_result = classify_intent(text, self._groq_client)
         intent = intent_result["intent"]
 
@@ -575,15 +724,8 @@ class CortexaBot:
 
         t_lower = text.strip().lower()
 
-        # --- POEM LISTING: \"what poems did I save\" etc. ---
-        if any(
-            phrase in t_lower
-            for phrase in (
-                "what poems did i save",
-                "list poems",
-                "show my poems",
-            )
-        ):
+        # --- POEM LISTING (legacy path) ---
+        if any(phrase in t_lower for phrase in ("what poem did i save", "what poems did i save", "list poems", "show my poem", "show my poems", "poems i saved", "my poems")):
             await self._handle_list_poems(context, chat_id)
             return
 
@@ -789,7 +931,11 @@ class CortexaBot:
                         # If extraction fails (403 paywall etc.), still save the URL as a bookmark.
                         try:
                             title_guess = text.splitlines()[0].strip()[:120] if text.strip() else url
-                            link_tags = tag_text(title_guess, self._groq_client)
+                            try:
+                                link_tags = tag_text(title_guess, self._groq_client)
+                            except Exception:  # noqa: BLE001
+                                # Tagging is non-critical; don't fail bookmark saves if Groq is down.
+                                link_tags = []
                             combined = (
                                 f"Title: {title_guess}\nURL: {url}\n\n"
                                 "(Bookmark saved; content fetch failed.)"

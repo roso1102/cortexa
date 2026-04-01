@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+import re
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 from groq import Groq
 from openai import OpenAI
@@ -26,6 +27,61 @@ def _build_messages(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": content},
     ]
+
+
+def _tokenize(s: str) -> List[str]:
+    toks = re.findall(r"[a-z0-9]{2,}", (s or "").lower())
+    stop = {
+        "the", "and", "for", "with", "that", "this", "you", "your", "are", "was", "were",
+        "can", "could", "would", "should", "what", "when", "where", "why", "how", "help",
+        "me", "my", "in", "on", "to", "of", "a", "an", "it", "i",
+    }
+    return [t for t in toks if t not in stop]
+
+
+def _score_link_ref(query: str, *, title: str, url: str, raw: str) -> float:
+    q = _tokenize(query)
+    if not q:
+        return 0.0
+    title_l = (title or "").lower()
+    url_l = (url or "").lower()
+    raw_l = (raw or "").lower()
+    score = 0.0
+    for tok in q[:12]:
+        if tok in title_l:
+            score += 3.0
+        elif tok in url_l:
+            score += 2.0
+        elif tok in raw_l:
+            score += 1.0
+    return score
+
+
+def _collect_relevant_link_refs(
+    query: str,
+    context_memories: Sequence[Dict[str, Any]],
+    *,
+    max_refs: int = 3,
+    min_score: float = 2.0,
+) -> List[str]:
+    scored: List[Tuple[float, str]] = []
+    seen_urls: set[str] = set()
+    for m in context_memories:
+        if m.get("source_type") != "link":
+            continue
+        url = str(m.get("url") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        title = str(m.get("title") or "").strip()
+        raw = str(m.get("raw_content") or "")
+        label = title if title and title != url else url
+        s = _score_link_ref(query, title=title, url=url, raw=raw)
+        scored.append((s, f"- {label}: {url}"))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    kept = [ref for s, ref in scored if s >= min_score][:max_refs]
+    return kept
 
 
 class BrainsRouter:
@@ -73,11 +129,10 @@ class BrainsRouter:
         context_memories: List[Dict[str, Any]],
         mode_hint: Optional[Literal["fast", "deep"]] = None,
         profile_context: Optional[str] = None,
+        source_refs: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         # Keep context tight to reduce token usage and rambling answers.
         context_chunks = []
-        source_refs: List[str] = []
-        seen_urls: set = set()
 
         for m in context_memories:
             raw = m.get("raw_content")
@@ -85,13 +140,9 @@ class BrainsRouter:
                 continue
             context_chunks.append(str(raw)[:1200])
 
-            # Collect unique source references from link-type memories
-            url = m.get("url", "")
-            title = m.get("title", "")
-            if url and url not in seen_urls and m.get("source_type") == "link":
-                seen_urls.add(url)
-                label = title if title and title != url else url
-                source_refs.append(f"- {label}: {url}")
+        # Source references are optional and must be relevant.
+        if source_refs is None:
+            source_refs = _collect_relevant_link_refs(query, context_memories)
 
         # Prepend profile context as an extra memory chunk when available
         if profile_context:
@@ -124,10 +175,10 @@ class BrainsRouter:
                 answer = self._call_groq(messages)
                 model_used = "groq-llama-3.1-8b-instant"
 
-        # Append a clean Sources section when link references were used
+        # Append a clean Saved links section when link references were used
         if source_refs:
-            sources_block = "\n\nSources:\n" + "\n".join(source_refs)
-            answer = answer.rstrip() + sources_block
+            saved_links_block = "\n\nSaved links:\n" + "\n".join(source_refs)
+            answer = answer.rstrip() + saved_links_block
 
         return {
             "answer": answer,
