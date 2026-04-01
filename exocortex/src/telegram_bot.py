@@ -625,6 +625,22 @@ class CortexaBot:
             return True
         return "help me" in t or "can help me" in t
 
+    def _extract_user_link_heading(self, text: str, urls: list[str]) -> str:
+        """
+        Prefer user-typed heading when a message contains both text and URLs.
+        Example: '"The Infinity Machine" https://...' -> 'The Infinity Machine'
+        """
+        s = (text or "").strip()
+        if not s:
+            return ""
+        for u in urls[:3]:
+            if u:
+                s = s.replace(u, " ")
+        # Collapse whitespace and trim common wrappers/quotes.
+        s = re.sub(r"\s+", " ", s).strip()
+        s = s.strip(" \t\n\r\"'“”`-:|")
+        return s[:120].strip()
+
     def _rerank_simple_recall(self, contexts: list[dict[str, Any]], user_text: str) -> list[dict[str, Any]]:
         """
         Pinecone semantic recall is sometimes too fuzzy for "what did I save about X".
@@ -1012,6 +1028,7 @@ class CortexaBot:
         urls = extract_urls(text)
         if intent == INTENT_INGEST_LINK or (urls and intent != INTENT_QUERY):
             if urls:
+                user_heading = self._extract_user_link_heading(text, urls)
                 for url in urls[:3]:
                     err = validate_url(url)
                     if err:
@@ -1031,7 +1048,8 @@ class CortexaBot:
                                 f"[debug] link_extracted title_len={len(extracted.title)} chars={len(extracted.text)}",
                             )
 
-                        header = f"Title: {extracted.title or extracted.url}\nURL: {extracted.url}\n\n"
+                        preferred_title = user_heading or extracted.title or extracted.url
+                        header = f"Title: {preferred_title}\nURL: {extracted.url}\n\n"
                         combined = header + extracted.text.strip()
                         chunks_for_tags = chunk_text(combined)[:1]
                         # Tag from the first chunk (most representative content)
@@ -1042,7 +1060,7 @@ class CortexaBot:
                             "chat_id": chat_id,
                             "user_id": chat_id,
                             "url": extracted.url,
-                            "title": extracted.title or extracted.url,
+                            "title": preferred_title,
                             "created_at": utc_now_iso(),
                             "created_at_ts": utc_now_ts(),
                             "tags": link_tags,
@@ -1054,7 +1072,7 @@ class CortexaBot:
                             chunk_source_type="link_chunk",
                         )
 
-                        title_display = extracted.title or extracted.url
+                        title_display = preferred_title
                         await self._send_text(
                             context,
                             chat_id,
@@ -1071,7 +1089,7 @@ class CortexaBot:
                         logger.exception("Failed to ingest link: %s", exc)
                         # If extraction fails (403 paywall etc.), still save the URL as a bookmark.
                         try:
-                            title_guess = text.splitlines()[0].strip()[:120] if text.strip() else url
+                            title_guess = user_heading or (text.splitlines()[0].strip()[:120] if text.strip() else url)
                             try:
                                 link_tags = tag_text(title_guess, self._groq_client)
                             except Exception:  # noqa: BLE001
