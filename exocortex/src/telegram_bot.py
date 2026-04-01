@@ -425,8 +425,19 @@ class CortexaBot:
 
         kind_l = (kind or "").strip().lower()
         topic_tokens = re.findall(r"[a-z0-9]+", (topic or "").lower())
+        kind_aliases: dict[str, list[str]] = {
+            "short story": ["short story", "story", "fiction", "narrative"],
+            "story": ["story", "short story", "fiction", "narrative"],
+            "limerick": ["limerick", "poem", "poetry", "verse"],
+            "poem": ["poem", "poetry", "verse", "limerick"],
+            "news": ["news", "article", "report", "headline"],
+            "article": ["article", "news", "post", "writeup"],
+            "note": ["note", "notes", "memo"],
+            "memory": ["memory", "note", "journal"],
+        }
+        kind_terms = kind_aliases.get(kind_l, [kind_l] if kind_l else [])
 
-        matches: list[dict[str, Any]] = []
+        scored: list[tuple[float, dict[str, Any]]] = []
         for m in candidates:
             source_type = str(m.get("source_type") or "")
             if source_type.endswith("_chunk") or m.get("is_full") is False:
@@ -439,13 +450,44 @@ class CortexaBot:
                     source_type.lower(),
                 ]
             )
-            if kind_l and kind_l not in text_blob:
-                continue
-            if topic_tokens and not any(tok in text_blob for tok in topic_tokens[:8]):
-                continue
-            matches.append(m)
-            if len(matches) >= max(1, min(limit, 12)):
-                break
+            score = 0.0
+            if kind_terms:
+                if any(term and term in text_blob for term in kind_terms):
+                    score += 2.0
+            else:
+                score += 0.5
+            if topic_tokens:
+                topic_hits = sum(1 for tok in topic_tokens[:8] if tok in text_blob)
+                if topic_hits == 0:
+                    continue
+                score += float(topic_hits) * 2.0
+            score += float(m.get("score") or 0.0)
+            if score > 0:
+                scored.append((score, m))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        matches = [m for _, m in scored[: max(1, min(limit, 12))]]
+
+        # Fallback: if kind is too strict, relax to topic-only retrieval.
+        if not matches and topic_tokens:
+            for m in candidates:
+                source_type = str(m.get("source_type") or "")
+                if source_type.endswith("_chunk") or m.get("is_full") is False:
+                    continue
+                text_blob = " ".join(
+                    [
+                        str(m.get("title") or "").lower(),
+                        str(m.get("raw_content") or "").lower(),
+                        " ".join([str(t).lower() for t in (m.get("tags") or [])]),
+                        source_type.lower(),
+                    ]
+                )
+                topic_hits = sum(1 for tok in topic_tokens[:8] if tok in text_blob)
+                if topic_hits <= 0:
+                    continue
+                scored.append((float(topic_hits) + float(m.get("score") or 0.0), m))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            matches = [m for _, m in scored[: max(1, min(limit, 12))]]
 
         if not matches:
             hint_parts = []
