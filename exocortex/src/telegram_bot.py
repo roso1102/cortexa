@@ -4,7 +4,9 @@ import logging
 import os
 import tempfile
 import re
+import hashlib
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import fitz  # PyMuPDF
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -344,6 +346,17 @@ class CortexaBot:
             pass
         return None
 
+    def _list_candidates(self, *, chat_id: int, query_text: str, k: int = 60) -> list[dict[str, Any]]:
+        """
+        Shared list/query candidate fetch path used by LIST wrappers.
+        """
+        return self._memory.query_by_filter_for_chat(
+            query_text=query_text,
+            chat_id=chat_id,
+            filter_obj={},
+            k=k,
+        )
+
     async def _handle_list_poems(
         self,
         context: ContextTypes.DEFAULT_TYPE,
@@ -357,14 +370,17 @@ class CortexaBot:
         """
         # Pinecone metadata filters do not support "$contains" on arrays,
         # so we fetch a broader slice for this chat and filter by tags client-side.
-        candidates = self._memory.query_by_filter_for_chat(
-            query_text="poem verse poetry",
-            chat_id=chat_id,
-            filter_obj={},
-            k=50,
-        )
+        candidates = self._list_candidates(chat_id=chat_id, query_text="poem verse poetry", k=50)
 
-        topic_tokens = re.findall(r"[a-z0-9]+", (topic or "").lower())
+        topic_stop = {
+            "a", "an", "the", "about", "my", "i", "me", "to", "of", "in", "on", "for", "and", "or", "is", "are",
+            "was", "were", "did", "do", "does", "what", "which", "who", "whom", "this", "that",
+        }
+        topic_tokens = [
+            tok
+            for tok in re.findall(r"[a-z0-9]+", (topic or "").lower())
+            if tok not in topic_stop and len(tok) >= 3
+        ]
         scored: list[tuple[float, dict[str, Any]]] = []
         for m in candidates:
             source_type = str(m.get("source_type") or "")
@@ -376,12 +392,24 @@ class CortexaBot:
             lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
             text_blob = " ".join([title.lower(), raw.lower(), " ".join(tags), source_type.lower()])
             score = 0.0
+            poem_signal = False
             if "poem" in tags or "poetry" in tags or "verse" in tags:
                 score += 3.0
+                poem_signal = True
             if source_type.lower() in {"poem", "poetry"}:
                 score += 3.0
+                poem_signal = True
+            if any(k in title.lower() for k in ("poem", "limerick", "verse")):
+                score += 1.5
+                poem_signal = True
             if len(lines) >= 6 and len(raw) >= 180:
                 score += 1.5
+                poem_signal = True
+
+            # Never include clearly non-poem items in LIST poems.
+            if not poem_signal:
+                continue
+
             if topic_tokens:
                 topic_hits = sum(1 for tok in topic_tokens[:8] if tok in text_blob)
                 if topic_hits == 0:
@@ -444,12 +472,7 @@ class CortexaBot:
             query_text_parts.append(kind)
         if topic:
             query_text_parts.append(topic)
-        candidates = self._memory.query_by_filter_for_chat(
-            query_text=" ".join(query_text_parts),
-            chat_id=chat_id,
-            filter_obj={},
-            k=60,
-        )
+        candidates = self._list_candidates(chat_id=chat_id, query_text=" ".join(query_text_parts), k=60)
 
         kind_l = (kind or "").strip().lower()
         topic_tokens = re.findall(r"[a-z0-9]+", (topic or "").lower())
@@ -579,6 +602,7 @@ class CortexaBot:
         self._memory.add_memory(text, full_meta)
 
         if insert_memory is not None:
+            source_url = self._canonicalize_url(str(base_meta.get("url") or base_meta.get("source_url") or ""))
             row = {
                 "memory_id": full_id,
                 "user_id": int(base_meta.get("user_id") or base_meta.get("chat_id") or 0),
@@ -586,7 +610,9 @@ class CortexaBot:
                 "title": base_meta.get("title"),
                 "raw_content_full": text,
                 "source_type": str(base_meta.get("source_type") or "text"),
-                "source_url": base_meta.get("url") or base_meta.get("source_url"),
+                "source_url": source_url,
+                "text_fingerprint": self._text_fingerprint(text),
+                "url_fingerprint": self._url_fingerprint(source_url) if source_url else None,
                 "tags": base_meta.get("tags"),
                 "created_at_ts": int(base_meta.get("created_at_ts") or utc_now_ts()),
                 "due_at_ts": base_meta.get("due_at_ts"),
@@ -672,7 +698,42 @@ class CortexaBot:
     def _normalize_exact_text(self, text: str) -> str:
         return re.sub(r"\s+", " ", (text or "").strip()).lower()
 
+    def _text_fingerprint(self, text: str) -> str:
+        normalized = self._normalize_exact_text(text)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
+
+    def _canonicalize_url(self, url: str) -> str:
+        u = (url or "").strip()
+        if not u:
+            return ""
+        try:
+            p = urlparse(u)
+            scheme = (p.scheme or "https").lower()
+            host = (p.hostname or "").lower()
+            path = p.path or "/"
+            query = "&".join(
+                part for part in (p.query or "").split("&")
+                if part and not part.lower().startswith(("utm_", "fbclid=", "gclid=", "mc_cid=", "mc_eid="))
+            )
+            return urlunparse((scheme, host, path.rstrip("/") or "/", "", query, ""))
+        except Exception:
+            return u
+
+    def _url_fingerprint(self, url: str) -> str:
+        canonical = self._canonicalize_url(url)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest() if canonical else ""
+
     def _find_duplicate_text_memory_id(self, *, chat_id: int, text: str) -> str | None:
+        fp = self._text_fingerprint(text)
+        if fp:
+            try:
+                from src.db import find_memory_id_by_text_fingerprint
+                found = find_memory_id_by_text_fingerprint(chat_id=chat_id, text_fingerprint=fp)
+                if found:
+                    return found
+            except Exception:
+                pass
+
         normalized = self._normalize_exact_text(text)
         if not normalized:
             return None
@@ -702,9 +763,18 @@ class CortexaBot:
         return None
 
     def _find_duplicate_link_memory_id(self, *, chat_id: int, url: str) -> str | None:
-        u = (url or "").strip()
+        u = self._canonicalize_url(url)
         if not u:
             return None
+        fp = self._url_fingerprint(u)
+        if fp:
+            try:
+                from src.db import find_memory_id_by_url_fingerprint
+                found = find_memory_id_by_url_fingerprint(chat_id=chat_id, url_fingerprint=fp)
+                if found:
+                    return found
+            except Exception:
+                pass
         try:
             from src.db import get_engine
             from sqlalchemy import text as sa_text
@@ -1120,7 +1190,8 @@ class CortexaBot:
             if urls:
                 user_heading = self._extract_user_link_heading(text, urls)
                 for url in urls[:3]:
-                    dup_id = self._find_duplicate_link_memory_id(chat_id=chat_id, url=url)
+                    canonical_url = self._canonicalize_url(url)
+                    dup_id = self._find_duplicate_link_memory_id(chat_id=chat_id, url=canonical_url)
                     if dup_id:
                         dash_url = self._dashboard_memory_url(dup_id)
                         msg = "You have already saved this before."
@@ -1128,19 +1199,19 @@ class CortexaBot:
                             msg += f"\nOpen: {dash_url}"
                         await self._send_text(context, chat_id, msg)
                         if self._debug_mode:
-                            await self._send_text(context, chat_id, f"[debug] duplicate_link memory_id={dup_id} url={url}")
+                            await self._send_text(context, chat_id, f"[debug] duplicate_link memory_id={dup_id} url={canonical_url}")
                         continue
-                    err = validate_url(url)
+                    err = validate_url(canonical_url)
                     if err:
-                        await self._send_text(context, chat_id, f"Can't save that link ({err}):\n{url}")
+                        await self._send_text(context, chat_id, f"Can't save that link ({err}):\n{canonical_url}")
                         if self._debug_mode:
-                            await self._send_text(context, chat_id, f"[debug] link_blocked url={url} reason={err}")
+                            await self._send_text(context, chat_id, f"[debug] link_blocked url={canonical_url} reason={err}")
                         continue
 
                     if self._debug_mode:
-                        await self._send_text(context, chat_id, f"[debug] link_fetch_start url={url}")
+                        await self._send_text(context, chat_id, f"[debug] link_fetch_start url={canonical_url}")
                     try:
-                        extracted = fetch_and_extract(url)
+                        extracted = fetch_and_extract(canonical_url)
                         if self._debug_mode:
                             await self._send_text(
                                 context,
@@ -1159,7 +1230,7 @@ class CortexaBot:
                             "source_type": "link",
                             "chat_id": chat_id,
                             "user_id": chat_id,
-                            "url": extracted.url,
+                            "url": self._canonicalize_url(extracted.url),
                             "title": preferred_title,
                             "created_at": utc_now_iso(),
                             "created_at_ts": utc_now_ts(),
@@ -1219,10 +1290,10 @@ class CortexaBot:
                             await self._send_text(
                                 context,
                                 chat_id,
-                                f'I saved the link as a bookmark (the site blocked extraction):\n{url}',
+                                f'I saved the link as a bookmark (the site blocked extraction):\n{canonical_url}',
                             )
                         except Exception:
-                            await self._send_text(context, chat_id, f"Sorry, I ran into a problem fetching that link.\n{url}")
+                            await self._send_text(context, chat_id, f"Sorry, I ran into a problem fetching that link.\n{canonical_url}")
                         if self._debug_mode:
                             await self._send_text(context, chat_id, f"[debug] link_error type={type(exc).__name__} msg={exc}")
                 return

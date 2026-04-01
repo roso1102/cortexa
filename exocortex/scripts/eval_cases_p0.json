@@ -1,0 +1,28 @@
+[
+  {
+    "name": "query_not_saved_screen_recording",
+    "text": "What can help me with recording my laptop screen",
+    "expect_action_in": ["ANSWER_QUERY", "LIST"]
+  },
+  {
+    "name": "poem_listing_with_topic",
+    "text": "what poem did i save about a girl",
+    "expect_action_in": ["LIST"],
+    "expect_list_type": "poems"
+  },
+  {
+    "name": "save_link_heading",
+    "text": "\"The Infinity Machine\" https://www.penguinrandomhouse.com/books/752231/the-infinity-machine-by-sebastian-mallaby/",
+    "expect_action_in": ["SAVE_LINK"]
+  },
+  {
+    "name": "ambiguous_clarify",
+    "text": "screen recording",
+    "expect_action_in": ["CLARIFY", "ANSWER_QUERY", "LIST"]
+  },
+  {
+    "name": "reminder_requires_time",
+    "text": "remind me to call mom",
+    "expect_action_not_in": ["SET_REMINDER"]
+  }
+]

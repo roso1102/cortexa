@@ -31,7 +31,9 @@ from src.action_schema import (  # noqa: E402
     LIST_LINKS,
     LIST_MEMORIES,
     LIST_POEMS,
+    ROUTER_CLARIFY_THRESHOLD,
     RoutedAction,
+    normalize_list_args,
     parse_routed_action,
 )
 
@@ -153,7 +155,7 @@ def route_action(text: str, groq_client: Groq) -> RoutedAction:
             if args.get("topic"):
                 poem_args["topic"] = str(args["topic"])
             args = poem_args
-        return RoutedAction(action=ACTION_LIST, confidence=0.95, reason="pre-check: memory listing request", args=args)
+        return RoutedAction(action=ACTION_LIST, confidence=0.95, reason="pre-check: memory listing request", args=normalize_list_args(args))
 
     # Fast-path: obvious queries
     if _is_obvious_query(header):
@@ -198,13 +200,15 @@ def route_action(text: str, groq_client: Groq) -> RoutedAction:
 
         # LIST validator
         if parsed.action == ACTION_LIST:
-            lt = str(parsed.args.get("list_type") or "").strip().lower()
-            if lt not in {LIST_POEMS, LIST_LINKS, LIST_MEMORIES}:
-                # default to memories if unspecified
-                parsed = RoutedAction(action=ACTION_LIST, confidence=parsed.confidence, reason=parsed.reason or "validator: default list_type", args={"list_type": LIST_MEMORIES})
+            parsed = RoutedAction(
+                action=ACTION_LIST,
+                confidence=parsed.confidence,
+                reason=parsed.reason or "validator: normalized list args",
+                args=normalize_list_args(parsed.args),
+            )
 
         # For confidence low, force CLARIFY
-        if parsed.confidence < 0.55 and parsed.action != ACTION_CLARIFY:
+        if parsed.confidence < ROUTER_CLARIFY_THRESHOLD and parsed.action != ACTION_CLARIFY:
             return RoutedAction(action=ACTION_CLARIFY, confidence=parsed.confidence, reason="low confidence", args={"question": "Do you want me to save this, or answer it?"})
 
         return parsed

@@ -90,6 +90,8 @@ memories = Table(
     Column("raw_content_full", Text, nullable=False),
     Column("source_type", String(64), nullable=False, index=True),
     Column("source_url", Text, nullable=True),
+    Column("text_fingerprint", String(64), nullable=True, index=True),
+    Column("url_fingerprint", String(64), nullable=True, index=True),
     Column("tags", JSON, nullable=True),
     Column("created_at_ts", BigInteger, nullable=False, index=True),
     Column("due_at_ts", BigInteger, nullable=True, index=True),
@@ -674,5 +676,70 @@ def fetch_tunnels_for_user(*, user_id: int, limit: int = 30) -> List[Dict[str, A
             }
         )
     return out
+
+
+def find_memory_id_by_text_fingerprint(*, chat_id: int, text_fingerprint: str) -> str | None:
+    """
+    Lookup exact duplicate by normalized text fingerprint.
+    Returns memory_id if found, else None.
+    """
+    if not text_fingerprint:
+        return None
+    try:
+        engine = get_engine()
+    except Exception:
+        return None
+    sql = sa_text(
+        """
+        SELECT memory_id
+        FROM memories
+        WHERE chat_id = :chat_id
+          AND is_full = true
+          AND text_fingerprint = :fp
+        ORDER BY created_at_ts DESC
+        LIMIT 1
+        """
+    )
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(sql, {"chat_id": chat_id, "fp": text_fingerprint}).fetchone()
+        if row:
+            return str(dict(row._mapping).get("memory_id") or "").strip() or None
+    except Exception:
+        return None
+    return None
+
+
+def find_memory_id_by_url_fingerprint(*, chat_id: int, url_fingerprint: str) -> str | None:
+    """
+    Lookup exact duplicate link by canonical URL fingerprint.
+    Returns memory_id if found, else None.
+    """
+    if not url_fingerprint:
+        return None
+    try:
+        engine = get_engine()
+    except Exception:
+        return None
+    sql = sa_text(
+        """
+        SELECT memory_id
+        FROM memories
+        WHERE chat_id = :chat_id
+          AND is_full = true
+          AND source_type = 'link'
+          AND url_fingerprint = :fp
+        ORDER BY created_at_ts DESC
+        LIMIT 1
+        """
+    )
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(sql, {"chat_id": chat_id, "fp": url_fingerprint}).fetchone()
+        if row:
+            return str(dict(row._mapping).get("memory_id") or "").strip() or None
+    except Exception:
+        return None
+    return None
 
 

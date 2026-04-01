@@ -17,6 +17,10 @@ ACTION_CLARIFY = "CLARIFY"
 LIST_POEMS = "poems"
 LIST_LINKS = "links"
 LIST_MEMORIES = "memories"
+ALLOWED_LIST_TYPES = {LIST_POEMS, LIST_LINKS, LIST_MEMORIES}
+ROUTER_CLARIFY_THRESHOLD = 0.55
+DEFAULT_LIST_LIMIT = 8
+MAX_LIST_LIMIT = 20
 
 
 @dataclass(frozen=True)
@@ -64,4 +68,44 @@ def should_clarify(*, routed: RoutedAction | None, threshold: float = 0.55) -> b
     if routed.action == ACTION_CLARIFY:
         return True
     return float(routed.confidence or 0.0) < threshold
+
+
+def normalize_list_args(args: Dict[str, Any] | None) -> Dict[str, Any]:
+    """
+    Normalize LIST action args into a stable contract:
+    - list_type: poems|links|memories (default memories)
+    - topic: optional short string
+    - kind/content_type: optional short string aliases
+    - limit: int in [1, MAX_LIST_LIMIT]
+    - time_range: optional short string
+    """
+    src = args or {}
+    out: Dict[str, Any] = {}
+
+    lt = str(src.get("list_type") or "").strip().lower()
+    if lt not in ALLOWED_LIST_TYPES:
+        lt = LIST_MEMORIES
+    out["list_type"] = lt
+
+    topic = str(src.get("topic") or "").strip()
+    if topic:
+        out["topic"] = topic[:120]
+
+    # Accept both "kind" and "content_type", normalize to "kind".
+    kind = str(src.get("kind") or src.get("content_type") or "").strip().lower()
+    if kind:
+        out["kind"] = kind[:60]
+
+    tr = str(src.get("time_range") or "").strip().lower()
+    if tr:
+        out["time_range"] = tr[:40]
+
+    raw_limit = src.get("limit")
+    try:
+        limit = int(raw_limit) if raw_limit is not None else DEFAULT_LIST_LIMIT
+    except Exception:
+        limit = DEFAULT_LIST_LIMIT
+    out["limit"] = max(1, min(limit, MAX_LIST_LIMIT))
+
+    return out
 

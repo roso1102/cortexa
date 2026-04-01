@@ -453,3 +453,40 @@ At maturity, cortexa becomes:
 * A cognitive amplifier.
 * A long-term thinking companion.
 * A research platform for modeling digital cognition.
+
+---
+
+## 13. P0 Core Reliability Runbook
+
+### Feature flags
+
+- `ACTION_ROUTER=true` enables the structured action router path.
+- `DEBUG_MODE=true` prints compact routing/action traces in Telegram.
+
+### Smoke prompts
+
+Run these after deploy/restart:
+
+1. `What can help me with recording my laptop screen`
+   - Expect: query answer, not saved as note.
+2. `"The Infinity Machine" https://...`
+   - Expect: heading preserved as title, link extracted/saved.
+3. Re-send the same text or same URL
+   - Expect: `You have already saved this before.` + dashboard `Open:` link.
+4. `what poem did i save about a girl`
+   - Expect: poem-only filtered list with dashboard links.
+
+### Regression gate command
+
+From `exocortex/`:
+
+`python scripts/eval_p0_core_gate.py`
+
+Optional override:
+
+`EVAL_CASES_FILE=scripts/eval_cases_p0.json python scripts/eval_p0_core_gate.py`
+
+### Rollback
+
+- Set `ACTION_ROUTER=false` to force legacy intent path.
+- Restart bot service.

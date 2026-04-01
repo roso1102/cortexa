@@ -44,6 +44,12 @@ desktop.ini
 *.log
 logs/
 
+# Planning docs (local)
+30dayroadmap.md
+30dayroadmap.json
+improvements.md
+improvements.json
+
 # Test / coverage
 .pytest_cache/
 .coverage
