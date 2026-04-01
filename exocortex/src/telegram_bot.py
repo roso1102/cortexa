@@ -492,6 +492,17 @@ class CortexaBot:
             return False
         return any(p in t for p in ["what did i save", "what i saved", "show me what i saved", "recall what i saved", "what do i know about"])
 
+    def _looks_like_general_query(self, text: str) -> bool:
+        t = (text or "").strip().lower()
+        if not t:
+            return False
+        if "?" in t:
+            return True
+        prefixes = ("what ", "how ", "why ", "when ", "where ", "who ", "which ", "can ", "could ", "should ")
+        if t.startswith(prefixes):
+            return True
+        return "help me" in t or "can help me" in t
+
     def _rerank_simple_recall(self, contexts: list[dict[str, Any]], user_text: str) -> list[dict[str, Any]]:
         """
         Pinecone semantic recall is sometimes too fuzzy for "what did I save about X".
@@ -583,6 +594,8 @@ class CortexaBot:
             return
 
         use_action_router = os.getenv("ACTION_ROUTER", "").strip().lower() in {"1", "true", "yes", "on"}
+        if self._debug_mode:
+            await self._send_text(context, chat_id, f"[debug] action_router_enabled={str(use_action_router).lower()}")
 
         # --- Option B: Action router (feature-flagged) ---
         if use_action_router:
@@ -713,6 +726,11 @@ class CortexaBot:
         # --- Legacy intent classifier path (default / fallback) ---
         intent_result = classify_intent(text, self._groq_client)
         intent = intent_result["intent"]
+        legacy_urls = extract_urls(text)
+        if intent == INTENT_INGEST_LINK and not legacy_urls and self._looks_like_general_query(text):
+            intent = INTENT_QUERY
+            intent_result["summary"] = "legacy-guardrail: INGEST_LINK without URL rerouted to QUERY"
+            intent_result["source"] = f"{intent_result.get('source', 'unknown')}+guardrail"
 
         if self._debug_mode:
             await self._send_text(
