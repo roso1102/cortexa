@@ -344,10 +344,16 @@ class CortexaBot:
             pass
         return None
 
-    async def _handle_list_poems(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:  # type: ignore[type-arg]
+    async def _handle_list_poems(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        *,
+        topic: str | None = None,
+    ) -> None:  # type: ignore[type-arg]
         """
         List recently saved poems and remember their ids for follow-up selection like "show poem 1".
-        Poems are detected heuristically via tags containing "poem".
+        Poems are detected heuristically (tags, source_type, verse-like shape), with optional topic filtering.
         """
         # Pinecone metadata filters do not support "$contains" on arrays,
         # so we fetch a broader slice for this chat and filter by tags client-side.
@@ -358,18 +364,40 @@ class CortexaBot:
             k=50,
         )
 
-        matches = []
+        topic_tokens = re.findall(r"[a-z0-9]+", (topic or "").lower())
+        scored: list[tuple[float, dict[str, Any]]] = []
         for m in candidates:
+            source_type = str(m.get("source_type") or "")
+            if source_type.endswith("_chunk") or m.get("is_full") is False:
+                continue
             tags = [str(t).lower() for t in (m.get("tags") or [])]
-            if "poem" in tags:
-                matches.append(m)
-            if len(matches) >= 10:
-                break
+            raw = str(m.get("raw_content") or "")
+            title = str(m.get("title") or "")
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            text_blob = " ".join([title.lower(), raw.lower(), " ".join(tags), source_type.lower()])
+            score = 0.0
+            if "poem" in tags or "poetry" in tags or "verse" in tags:
+                score += 3.0
+            if source_type.lower() in {"poem", "poetry"}:
+                score += 3.0
+            if len(lines) >= 6 and len(raw) >= 180:
+                score += 1.5
+            if topic_tokens:
+                topic_hits = sum(1 for tok in topic_tokens[:8] if tok in text_blob)
+                if topic_hits == 0:
+                    continue
+                score += float(topic_hits) * 2.0
+            score += float(m.get("score") or 0.0)
+            if score > 0:
+                scored.append((score, m))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        matches = [m for _, m in scored[:10]]
 
         if not matches:
             await self._send_text(context, chat_id, "I couldn't find any poems you've saved yet.")
             if self._debug_mode:
-                await self._send_text(context, chat_id, "[debug] poems_list count=0")  # type: ignore[arg-type]
+                await self._send_text(context, chat_id, f"[debug] poems_list count=0 topic={topic or '-'}")  # type: ignore[arg-type]
             return
 
         poem_ids: list[str] = []
@@ -396,7 +424,7 @@ class CortexaBot:
 
         await self._send_text(context, chat_id, "\n".join(lines).strip())
         if self._debug_mode:
-            await self._send_text(context, chat_id, f"[debug] poems_list count={len(poem_ids)}")  # type: ignore[arg-type]
+            await self._send_text(context, chat_id, f"[debug] poems_list count={len(poem_ids)} topic={topic or '-'}")  # type: ignore[arg-type]
 
     async def _handle_list_memories(
         self,
@@ -641,6 +669,67 @@ class CortexaBot:
         s = s.strip(" \t\n\r\"'“”`-:|")
         return s[:120].strip()
 
+    def _normalize_exact_text(self, text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+    def _find_duplicate_text_memory_id(self, *, chat_id: int, text: str) -> str | None:
+        normalized = self._normalize_exact_text(text)
+        if not normalized:
+            return None
+        try:
+            from src.db import get_engine
+            from sqlalchemy import text as sa_text
+
+            engine = get_engine()
+            sql = sa_text(
+                """
+                SELECT memory_id, raw_content_full
+                FROM memories
+                WHERE chat_id = :chat_id AND is_full = true
+                ORDER BY created_at_ts DESC
+                LIMIT 300
+                """
+            )
+            with engine.begin() as conn:
+                rows = conn.execute(sql, {"chat_id": chat_id}).fetchall()
+            for row in rows:
+                d = dict(row._mapping)
+                raw = str(d.get("raw_content_full") or "")
+                if self._normalize_exact_text(raw) == normalized:
+                    return str(d.get("memory_id") or "").strip() or None
+        except Exception:
+            return None
+        return None
+
+    def _find_duplicate_link_memory_id(self, *, chat_id: int, url: str) -> str | None:
+        u = (url or "").strip()
+        if not u:
+            return None
+        try:
+            from src.db import get_engine
+            from sqlalchemy import text as sa_text
+
+            engine = get_engine()
+            sql = sa_text(
+                """
+                SELECT memory_id
+                FROM memories
+                WHERE chat_id = :chat_id
+                  AND is_full = true
+                  AND source_type = 'link'
+                  AND source_url = :url
+                ORDER BY created_at_ts DESC
+                LIMIT 1
+                """
+            )
+            with engine.begin() as conn:
+                row = conn.execute(sql, {"chat_id": chat_id, "url": u}).fetchone()
+            if row:
+                return str(dict(row._mapping).get("memory_id") or "").strip() or None
+        except Exception:
+            return None
+        return None
+
     def _rerank_simple_recall(self, contexts: list[dict[str, Any]], user_text: str) -> list[dict[str, Any]]:
         """
         Pinecone semantic recall is sometimes too fuzzy for "what did I save about X".
@@ -755,7 +844,8 @@ class CortexaBot:
             if routed.action == ACTION_LIST:
                 lt = str(routed.args.get("list_type") or "").strip().lower()
                 if lt == LIST_POEMS:
-                    await self._handle_list_poems(context, chat_id)
+                    topic = str(routed.args.get("topic") or "").strip() or None
+                    await self._handle_list_poems(context, chat_id, topic=topic)
                     return
                 if lt == LIST_LINKS:
                     await self._handle_links_today(context, chat_id)
@@ -1030,6 +1120,16 @@ class CortexaBot:
             if urls:
                 user_heading = self._extract_user_link_heading(text, urls)
                 for url in urls[:3]:
+                    dup_id = self._find_duplicate_link_memory_id(chat_id=chat_id, url=url)
+                    if dup_id:
+                        dash_url = self._dashboard_memory_url(dup_id)
+                        msg = "You have already saved this before."
+                        if dash_url:
+                            msg += f"\nOpen: {dash_url}"
+                        await self._send_text(context, chat_id, msg)
+                        if self._debug_mode:
+                            await self._send_text(context, chat_id, f"[debug] duplicate_link memory_id={dup_id} url={url}")
+                        continue
                     err = validate_url(url)
                     if err:
                         await self._send_text(context, chat_id, f"Can't save that link ({err}):\n{url}")
@@ -1189,6 +1289,17 @@ class CortexaBot:
             return
 
         # --- INGEST_TEXT (default) ---
+        dup_text_id = self._find_duplicate_text_memory_id(chat_id=chat_id, text=text)
+        if dup_text_id:
+            dash_url = self._dashboard_memory_url(dup_text_id)
+            msg = "You have already saved this before."
+            if dash_url:
+                msg += f"\nOpen: {dash_url}"
+            await self._send_text(context, chat_id, msg)
+            if self._debug_mode:
+                await self._send_text(context, chat_id, f"[debug] duplicate_text memory_id={dup_text_id}")
+            return
+
         tags = tag_text(text, self._groq_client)
         metadata: dict[str, Any] = {
             "source_type": "text",

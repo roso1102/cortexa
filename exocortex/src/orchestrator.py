@@ -149,7 +149,10 @@ def route_action(text: str, groq_client: Groq) -> RoutedAction:
     if _is_list_memory_query(t):
         args = _extract_list_memory_filters(t)
         if args.get("kind") == "poem":
-            args = {"list_type": LIST_POEMS}
+            poem_args: dict[str, str] = {"list_type": LIST_POEMS}
+            if args.get("topic"):
+                poem_args["topic"] = str(args["topic"])
+            args = poem_args
         return RoutedAction(action=ACTION_LIST, confidence=0.95, reason="pre-check: memory listing request", args=args)
 
     # Fast-path: obvious queries
