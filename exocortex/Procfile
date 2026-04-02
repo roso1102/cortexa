@@ -1,1 +1,2 @@
+# One web dyno only: long-polling uses getUpdates; a second process with the same TELEGRAM_TOKEN → 409 Conflict.
 web: python main.py

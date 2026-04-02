@@ -476,6 +476,17 @@ Run these after deploy/restart:
 4. `what poem did i save about a girl`
    - Expect: poem-only filtered list with dashboard links.
 
+### Telegram `409 Conflict` (“only one bot instance”)
+
+Long polling (`run_polling`) allows **exactly one** process (worldwide) to call `getUpdates` per bot token.
+
+**Common causes**
+
+- **Multiple Heroku web dynos** (`web=2+`). Fix: `heroku ps:scale web=1` for this app, or use webhooks later.
+- **Same token in two places** (Heroku + local `python main.py`, second app, another machine). Fix: stop the extra process or use a **dev bot** with a separate token.
+
+**Quick checks:** `heroku ps` shows one `web` dyno; no local bot using production `TELEGRAM_TOKEN`. Brief 409s during deploy usually clear after the old dyno stops.
+
 ### Regression gate command
 
 From `exocortex/`:
