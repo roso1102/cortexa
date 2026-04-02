@@ -9,19 +9,19 @@ that the system has identified as a recurring theme in your thinking.
 Strategy:
   Rather than raw k-means on embedding vectors (which would require
   fetching all vectors from Pinecone — expensive on free tier), we
-  cluster by tag affinity:
+  cluster by **tag token overlap**:
 
-  1. Fetch all non-system memories from Pinecone (with metadata).
-  2. Build a tag → [memory_ids] inverted index.
-  3. Merge closely related tags into groups using a co-occurrence heuristic.
-  4. For each group, sample 3 representative snippet and ask Groq to name
-     the tunnel (e.g. "FPGA hardware design", "health & nutrition", …).
-  5. Store each tunnel as source_type=tunnel in Pinecone.
-  6. Stamp each constituent memory with tunnel_id (metadata update).
+  1. Fetch main memories (Postgres first; Pinecone fallback).
+  2. From each memory's tags, extract word tokens (e.g. "love poem" → love, poem).
+     Memories sharing a token (e.g. "poem") group together even if full tag strings differ.
+  3. Tokens that appear on too few memories are skipped; top clusters capped at _MAX_TUNNELS.
+  4. For each cluster, sample snippets and ask OpenRouter to name the tunnel.
+  5. Persist tunnel + stamp member memories in Postgres / Pinecone metadata.
 """
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -50,9 +50,105 @@ Snippets:
 {snippets}
 """
 
-_MIN_MEMORIES_FOR_TUNNEL = 3  # skip tags with too few memories
+_MIN_MEMORIES_FOR_TUNNEL = 3  # skip clusters with too few memories
 _MAX_TUNNELS = 8               # avoid tunnel explosion
 _SNIPPET_CHARS = 200           # max chars per snippet sent to LLM
+
+# Drop generic tokens so we do not form giant "the" / "note" tunnels.
+_TOKEN_STOP = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "you",
+        "are",
+        "not",
+        "but",
+        "with",
+        "that",
+        "this",
+        "from",
+        "your",
+        "have",
+        "has",
+        "was",
+        "were",
+        "can",
+        "our",
+        "their",
+        "what",
+        "when",
+        "where",
+        "which",
+        "how",
+        "why",
+        "who",
+        "its",
+        "also",
+        "just",
+        "like",
+        "one",
+        "all",
+        "any",
+        "get",
+        "got",
+        "use",
+        "using",
+        "used",
+        "new",
+        "way",
+        "may",
+        "out",
+        "about",
+        "into",
+        "over",
+        "than",
+        "then",
+        "some",
+        "such",
+        "here",
+        "there",
+        "each",
+        "both",
+        "few",
+        "other",
+        "own",
+        "same",
+        "note",
+        "notes",
+        "idea",
+        "ideas",
+        "link",
+        "links",
+        "saved",
+        "save",
+        "text",
+        "memory",
+        "memories",
+        "article",
+        "blog",
+        "post",
+        "page",
+        "http",
+        "https",
+        "com",
+        "org",
+        "www",
+    }
+)
+
+
+def _cluster_tokens_from_tags(tags: Any) -> set[str]:
+    """Word tokens (len>=3) from all tags on a memory; used to merge e.g. 'poem' + 'love poem'."""
+    out: set[str] = set()
+    if not tags:
+        return out
+    seq = tags if isinstance(tags, list) else [tags]
+    for tag in seq:
+        for tok in re.findall(r"[a-z0-9]+", str(tag).lower()):
+            if len(tok) >= 3 and tok not in _TOKEN_STOP:
+                out.add(tok)
+    return out
 
 
 def form_tunnels(memory: MemoryManager, groq: Groq, *, user_id: int, openrouter_api_key: str) -> List[Dict[str, Any]]:
@@ -88,27 +184,35 @@ def form_tunnels(memory: MemoryManager, groq: Groq, *, user_id: int, openrouter_
         logger.info("No memories available for tunnel formation")
         return []
 
-    # --- Build tag → memories index ---
-    tag_index: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    # --- Build token → memories (dedupe by memory id per token) ---
+    token_to_ids: dict[str, set[str]] = defaultdict(set)
+    id_to_memory: Dict[str, Dict[str, Any]] = {}
     untagged: List[Dict[str, Any]] = []
 
     for m in memories:
+        mid = str(m.get("id") or "").strip()
+        if not mid:
+            continue
+        id_to_memory[mid] = m
         tags = m.get("tags") or []
-        if not tags:
+        tokens = _cluster_tokens_from_tags(tags)
+        if not tokens:
             untagged.append(m)
             continue
-        for tag in tags:
-            tag_index[str(tag).strip().lower()].append(m)
+        for tok in tokens:
+            token_to_ids[tok].add(mid)
 
-    # --- Filter tags with enough memories ---
-    qualified_tags = {
-        tag: mems
-        for tag, mems in tag_index.items()
-        if len(mems) >= _MIN_MEMORIES_FOR_TUNNEL
-    }
+    qualified_tags: Dict[str, List[Dict[str, Any]]] = {}
+    for tok, ids in token_to_ids.items():
+        if len(ids) < _MIN_MEMORIES_FOR_TUNNEL:
+            continue
+        qualified_tags[tok] = [id_to_memory[i] for i in ids if i in id_to_memory]
 
     if not qualified_tags:
-        logger.info("Not enough tagged memories to form tunnels (need >= %d per tag)", _MIN_MEMORIES_FOR_TUNNEL)
+        logger.info(
+            "Not enough overlapping tag tokens to form tunnels (need >= %d memories sharing one token)",
+            _MIN_MEMORIES_FOR_TUNNEL,
+        )
         return []
 
     # --- Sort by cluster size, take top _MAX_TUNNELS ---
@@ -119,7 +223,8 @@ def form_tunnels(memory: MemoryManager, groq: Groq, *, user_id: int, openrouter_
     now_iso = utc_now_iso()
 
     for tag, tag_memories in sorted_tags:
-        tunnel_id = f"tunnel_{tag.replace(' ', '_')}_{now_ts}"
+        safe_slug = re.sub(r"[^a-z0-9_]+", "_", tag.strip().lower()).strip("_")[:48] or "theme"
+        tunnel_id = f"tunnel_{safe_slug}_{now_ts}"
 
         # Deduplicate memories by raw_content fingerprint
         seen: set = set()
