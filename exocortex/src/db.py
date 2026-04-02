@@ -39,7 +39,7 @@ from sqlalchemy import (
     text as sa_text,
 )
 from sqlalchemy.engine import Engine, Result
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -155,6 +155,19 @@ tunnel_members = Table(
 )
 
 
+# Existing deployments may have created `memories` before enrichment columns existed.
+# SQLAlchemy create_all() does not ALTER existing tables, so we add columns idempotently.
+_MEMORY_SCHEMA_PATCH_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE public.memories ADD COLUMN IF NOT EXISTS text_fingerprint text NULL",
+    "ALTER TABLE public.memories ADD COLUMN IF NOT EXISTS url_fingerprint text NULL",
+    "ALTER TABLE public.memories ADD COLUMN IF NOT EXISTS content_type text NULL",
+    "ALTER TABLE public.memories ADD COLUMN IF NOT EXISTS topics jsonb NULL",
+    "CREATE INDEX IF NOT EXISTS memories_chat_text_fp_idx ON public.memories (chat_id, text_fingerprint)",
+    "CREATE INDEX IF NOT EXISTS memories_chat_url_fp_idx ON public.memories (chat_id, url_fingerprint)",
+    "CREATE INDEX IF NOT EXISTS memories_user_content_type_idx ON public.memories (user_id, content_type)",
+)
+
+
 def init_db() -> None:
     """
     Create tables if they do not exist.
@@ -169,7 +182,10 @@ def init_db() -> None:
 
     try:
         _metadata.create_all(engine)
-        _log.info("Postgres schema ensured (tables created if missing).")
+        with engine.begin() as conn:
+            for stmt in _MEMORY_SCHEMA_PATCH_STATEMENTS:
+                conn.execute(sa_text(stmt))
+        _log.info("Postgres schema ensured (tables + memory enrichment columns).")
     except SQLAlchemyError as exc:
         raise RuntimeError(f"Failed to initialize Postgres schema: {exc}") from exc
 
@@ -233,6 +249,9 @@ def get_user_by_chat_id(chat_id: int) -> UserAuthRow | None:
         )
 
 
+_MEMORY_INSERT_ENRICHMENT_KEYS = frozenset({"text_fingerprint", "url_fingerprint", "content_type", "topics"})
+
+
 def insert_memory(row: dict[str, Any]) -> None:
     """
     Insert a canonical memory row.
@@ -244,9 +263,24 @@ def insert_memory(row: dict[str, Any]) -> None:
         _log.warning("Skipping insert_memory (DATABASE_URL missing): %s", exc)
         return
 
-    with engine.begin() as conn:
-        stmt = pg_insert(memories).values(**row).on_conflict_do_nothing(index_elements=["memory_id"])
-        conn.execute(stmt)
+    def _execute_INSERT(r: dict[str, Any]) -> None:
+        with engine.begin() as conn:
+            stmt = pg_insert(memories).values(**r).on_conflict_do_nothing(index_elements=["memory_id"])
+            conn.execute(stmt)
+
+    try:
+        _execute_INSERT(row)
+    except ProgrammingError as exc:
+        err = str(exc).lower()
+        if "undefinedcolumn" in err or "does not exist" in err:
+            slim = {k: v for k, v in row.items() if k not in _MEMORY_INSERT_ENRICHMENT_KEYS}
+            _log.warning(
+                "insert_memory retry without enrichment columns (migrate DB / restart app for auto-patch): %s",
+                exc,
+            )
+            _execute_INSERT(slim)
+        else:
+            raise
     _log.debug(
         "pg insert_memory ok memory_id=%s user_id=%s source_type=%s",
         row.get("memory_id"),
