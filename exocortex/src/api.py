@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -37,6 +38,27 @@ def _password_ok(stored_hash: str, password: str) -> bool:
     except ValueError as e:
         logger.warning("password_hash verify failed (malformed hash?): %s", e)
         return False
+
+
+def _maybe_notify_telegram_login(chat_id: int) -> None:
+    """Optional: ping Telegram after successful dashboard login (requires TELEGRAM_TOKEN)."""
+    tok = (os.getenv("TELEGRAM_TOKEN") or "").strip()
+    if not tok:
+        return
+    msg = (
+        "Dashboard login verified. You can manage memories on the web; "
+        "anything you save here stays linked to this chat."
+    )
+    try:
+        import requests
+
+        requests.post(
+            f"https://api.telegram.org/bot{tok}/sendMessage",
+            json={"chat_id": chat_id, "text": msg},
+            timeout=6,
+        ).raise_for_status()
+    except Exception as exc:
+        logger.warning("telegram login notify failed chat_id=%s: %s", chat_id, exc)
 
 
 def create_api_blueprint(
@@ -115,6 +137,11 @@ def create_api_blueprint(
 
         payload = {"user_id": chat_id_int, "chat_id": chat_id_int}
         token = serializer.dumps(payload)
+
+        notify = body.get("notify_telegram")
+        if notify in (True, "true", "1", 1):
+            _maybe_notify_telegram_login(chat_id_int)
+
         return jsonify({"token": token})
 
     @bp.get("/auth/telegram/start-link")

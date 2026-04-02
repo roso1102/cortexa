@@ -24,5 +24,55 @@
     "name": "reminder_requires_time",
     "text": "remind me to call mom",
     "expect_action_not_in": ["SET_REMINDER"]
+  },
+  {
+    "name": "greeting_clarify",
+    "text": "hi there",
+    "expect_action_in": ["CLARIFY", "ANSWER_QUERY"]
+  },
+  {
+    "name": "list_news_topic",
+    "text": "what news did i save about iran",
+    "expect_action_in": ["LIST"]
+  },
+  {
+    "name": "list_kind_story",
+    "text": "what short story did i save about winter",
+    "expect_action_in": ["LIST"]
+  },
+  {
+    "name": "list_limerick_flowers",
+    "text": "what limerick did i save about flowers",
+    "expect_action_in": ["LIST"]
+  },
+  {
+    "name": "explicit_save_note",
+    "text": "save this note: remember to buy milk",
+    "expect_action_in": ["SAVE_TEXT", "CLARIFY", "SET_REMINDER"]
+  },
+  {
+    "name": "general_knowledge_question",
+    "text": "What is photosynthesis in one sentence?",
+    "expect_action_in": ["ANSWER_QUERY", "CLARIFY"]
+  },
+  {
+    "name": "mixed_url_and_words",
+    "text": "Check this https://github.com/octocat/Hello-World interesting project",
+    "expect_action_in": ["SAVE_LINK", "ANSWER_QUERY", "SAVE_TEXT", "CLARIFY"]
+  },
+  {
+    "name": "long_prose_looks_like_save",
+    "text": "In a small coastal town where the fog never truly lifted, Mara found an old brass key washed up beside the pier. She assumed it belonged to no one, yet it warmed her palm as if it remembered a hand.",
+    "expect_action_in": ["SAVE_TEXT", "CLARIFY", "ANSWER_QUERY"]
+  },
+  {
+    "name": "code_snippet",
+    "text": "def add(a, b):\n    return a + b",
+    "expect_action_in": ["SAVE_TEXT", "ANSWER_QUERY", "CLARIFY"]
+  },
+  {
+    "name": "delete_last_command",
+    "text": "delete last",
+    "expect_action_in": ["DELETE"]
   }
 ]

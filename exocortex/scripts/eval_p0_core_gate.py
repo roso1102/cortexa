@@ -7,6 +7,7 @@ from typing import Any
 from groq import Groq
 from dotenv import load_dotenv
 
+from src.action_schema import ALLOWED_LIST_TYPES, ALLOWED_ROUTER_ACTIONS, ACTION_LIST, normalize_list_args
 from src.config import load_config
 from src.orchestrator import route_action
 
@@ -40,6 +41,16 @@ def main() -> None:
         action = routed.action
         args = routed.args or {}
         print(f"- {name}: action={action} confidence={routed.confidence:.2f} args={args}")
+
+        if action not in ALLOWED_ROUTER_ACTIONS:
+            failures.append(f"{name}: action not in contract: {action!r}")
+        if not isinstance(routed.args, dict):
+            failures.append(f"{name}: routed.args must be dict, got {type(routed.args).__name__}")
+        if action == ACTION_LIST:
+            na = normalize_list_args(routed.args)
+            lt = str(na.get("list_type") or "")
+            if lt not in ALLOWED_LIST_TYPES:
+                failures.append(f"{name}: LIST list_type invalid: {lt!r} normalized={na!r}")
 
         allowed = case.get("expect_action_in")
         if isinstance(allowed, list) and allowed:

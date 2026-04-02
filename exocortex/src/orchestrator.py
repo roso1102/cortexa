@@ -147,6 +147,15 @@ def route_action(text: str, groq_client: Groq) -> RoutedAction:
     if t.startswith(("save this", "save:", "note this", "note:", "log this", "journal this")) and "http" not in t:
         return RoutedAction(action=ACTION_SAVE_TEXT, confidence=0.9, reason="pre-check: explicit save", args={"text": raw_full})
 
+    # Fast-path: delete/remove memory commands
+    if t.startswith("delete ") or t.startswith("remove "):
+        return RoutedAction(
+            action=ACTION_DELETE,
+            confidence=0.95,
+            reason="pre-check: delete/remove command",
+            args={"target": raw_full},
+        )
+
     # Fast-path: ambiguous short phrases should clarify instead of being silently saved.
     if _looks_ambiguous_short_phrase(header):
         return RoutedAction(
@@ -235,14 +244,21 @@ def route_action(text: str, groq_client: Groq) -> RoutedAction:
         if intent == INTENT_DELETE:
             return RoutedAction(action=ACTION_DELETE, confidence=float(legacy.get("confidence") or 0.6), reason="fallback: legacy intent DELETE", args={"target": raw_full})
         if intent == INTENT_INGEST_LINK:
-            urls = re.findall(r"https?://\\S+", raw_full)
+            urls = re.findall(r"https?://\S+", raw_full)
             return RoutedAction(action=ACTION_SAVE_LINK, confidence=float(legacy.get("confidence") or 0.6), reason="fallback: legacy intent INGEST_LINK", args={"urls": urls[:3]})
         # default
         return RoutedAction(action=ACTION_SAVE_TEXT, confidence=float(legacy.get("confidence") or 0.6), reason="fallback: legacy intent INGEST_TEXT", args={"text": raw_full})
 
 # Salutations / small-talk phrases — should get a friendly reply, not be saved
 _CHITCHAT_PHRASES = frozenset({
-    "hi", "hello", "hey", "heyy", "heya",
+    "hi",
+    "hello",
+    "hey",
+    "heyy",
+    "heya",
+    "hi there",
+    "hello there",
+    "hey there",
     "bye", "goodbye", "good bye", "cya", "see ya", "see you",
     "good night", "goodnight", "gn", "gn!",
     "good morning", "gm", "good afternoon", "good evening",

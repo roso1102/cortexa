@@ -138,32 +138,12 @@ def _sanitize_extracted(text: str) -> str:
     return "\n".join(clean_lines)
 
 
-def fetch_and_extract(url: str, timeout_s: int = 15, max_bytes: int = 2_000_000) -> LinkExtract:
-    """
-    Fetch a URL and extract readable main text.
-    Safety:
-    - caps download size
-    - uses timeouts
-    - does NOT execute JS (requests only)
-    """
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if host in {"x.com", "twitter.com"} or host.endswith(".x.com") or host.endswith(".twitter.com"):
-        x = _try_extract_x_oembed(url, timeout_s=timeout_s)
-        if x and x.text:
-            return x
-
-    headers = {
-        "User-Agent": "cortexa/0.1 (link-ingestion; +https://example.local)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-
+def _download_html(url: str, *, headers: dict[str, str], timeout_s: int, max_bytes: int) -> str:
     with requests.get(url, headers=headers, timeout=timeout_s, stream=True) as resp:
         resp.raise_for_status()
 
         content_type = (resp.headers.get("content-type") or "").lower()
         if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
-            # Still try to parse if it looks like text, but avoid huge binaries
             if "text/" not in content_type:
                 raise ValueError(f"Unsupported content-type: {content_type or 'unknown'}")
 
@@ -177,14 +157,67 @@ def fetch_and_extract(url: str, timeout_s: int = 15, max_bytes: int = 2_000_000)
                 raise ValueError("Page too large to ingest safely")
             chunks.append(part)
 
-    html = b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
+    return b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
 
+
+def _extract_from_html(html: str, url: str) -> LinkExtract:
     downloaded = trafilatura.extract(html, include_comments=False, include_tables=False) or ""
-    title = trafilatura.extract_metadata(html).title if trafilatura.extract_metadata(html) else ""
-
+    meta = trafilatura.extract_metadata(html)
+    title = meta.title if meta else ""
     text = _sanitize_extracted(downloaded.strip())
     if not text:
         raise ValueError("Could not extract readable text from page")
-
     return LinkExtract(url=url, title=(title or "").strip(), text=text)
+
+
+def fetch_and_extract(url: str, timeout_s: int = 15, max_bytes: int = 2_000_000) -> LinkExtract:
+    """
+    Fetch a URL and extract readable main text.
+    Retries once with a browser-like User-Agent if the first fetch/extract fails
+    (helps with Wikipedia and similar sites that filter bot UAs).
+
+    Safety:
+    - caps download size
+    - uses timeouts
+    - does NOT execute JS (requests only)
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host in {"x.com", "twitter.com"} or host.endswith(".x.com") or host.endswith(".twitter.com"):
+        x = _try_extract_x_oembed(url, timeout_s=timeout_s)
+        if x and x.text:
+            return x
+
+    attempts: list[tuple[dict[str, str], int]] = [
+        (
+            {
+                "User-Agent": "cortexa/0.1 (link-ingestion; +https://example.local)",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            timeout_s,
+        ),
+        (
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            min(timeout_s + 10, 30),
+        ),
+    ]
+
+    last_err: Exception | None = None
+    for hdrs, to in attempts:
+        try:
+            html = _download_html(url, headers=hdrs, timeout_s=to, max_bytes=max_bytes)
+            return _extract_from_html(html, url)
+        except Exception as exc:
+            last_err = exc
+            continue
+
+    assert last_err is not None
+    raise last_err
 

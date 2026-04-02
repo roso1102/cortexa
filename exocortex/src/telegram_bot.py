@@ -391,6 +391,15 @@ class CortexaBot:
             pass
         return None
 
+    def _recency_bonus(self, m: dict[str, Any]) -> float:
+        """Small score lift for newer memories (decays over ~21 days)."""
+        ts = int(m.get("created_at_ts") or 0)
+        if not ts:
+            return 0.0
+        age = max(0, utc_now_ts() - ts)
+        half_life = 21 * 86400
+        return max(0.0, 0.22 * (1.0 - min(age / half_life, 1.0)))
+
     def _list_candidates(self, *, chat_id: int, query_text: str, k: int = 60) -> list[dict[str, Any]]:
         """
         Shared list/query candidate fetch path used by LIST wrappers.
@@ -461,6 +470,7 @@ class CortexaBot:
                     continue
                 score += float(topic_hits) * 2.0
             score += float(m.get("score") or 0.0)
+            score += self._recency_bonus(m)
             if score > 0:
                 scored.append((score, m))
 
@@ -560,6 +570,7 @@ class CortexaBot:
                     continue
                 score += float(topic_hits) * 2.0
             score += float(m.get("score") or 0.0)
+            score += self._recency_bonus(m)
             if score > 0:
                 scored.append((score, m))
 
@@ -585,7 +596,8 @@ class CortexaBot:
                 topic_hits = sum(1 for tok in topic_tokens[:8] if tok in text_blob)
                 if topic_hits <= 0:
                     continue
-                scored.append((float(topic_hits) + float(m.get("score") or 0.0), m))
+                fb = float(topic_hits) + float(m.get("score") or 0.0) + self._recency_bonus(m)
+                scored.append((fb, m))
             scored.sort(key=lambda x: x[0], reverse=True)
             matches = [m for _, m in scored[: max(1, min(limit, 12))]]
 
@@ -924,7 +936,7 @@ class CortexaBot:
                     lex += 1.0
 
             max_lex = max(max_lex, lex)
-            rescored.append((prior + lex, lex, m))
+            rescored.append((prior + lex + self._recency_bonus(m), lex, m))
 
         # If we have any items with lexical hits, drop pure semantic junk.
         filtered: list[tuple[float, float, dict[str, Any]]] = []
@@ -949,6 +961,9 @@ class CortexaBot:
             await self._send_text(context, chat_id, "Sorry, this is a private memory system.")
             return
 
+        input_hash = hashlib.sha256(self._normalize_exact_text(text).encode("utf-8")).hexdigest()[:16]
+        logger.info("turn_begin chat_id=%s input_hash=%s text_len=%s", chat_id, input_hash, len(text))
+
         use_action_router = os.getenv("ACTION_ROUTER", "").strip().lower() in {"1", "true", "yes", "on"}
         if self._debug_mode:
             await self._send_text(context, chat_id, f"[debug] action_router_enabled={str(use_action_router).lower()}")
@@ -957,8 +972,9 @@ class CortexaBot:
         if use_action_router:
             routed = route_action(text, self._groq_client)
             logger.info(
-                "router_decision chat_id=%s action=%s confidence=%.2f reason=%s",
+                "router_decision chat_id=%s input_hash=%s action=%s confidence=%.2f reason=%s",
                 chat_id,
+                input_hash,
                 routed.action,
                 float(routed.confidence or 0.0),
                 routed.reason,
@@ -1098,8 +1114,9 @@ class CortexaBot:
         intent_result = classify_intent(text, self._groq_client)
         intent = intent_result["intent"]
         logger.info(
-            "legacy_intent chat_id=%s intent=%s confidence=%.2f source=%s",
+            "legacy_intent chat_id=%s input_hash=%s intent=%s confidence=%.2f source=%s",
             chat_id,
+            input_hash,
             intent,
             float(intent_result.get("confidence") or 0.0),
             intent_result.get("source"),

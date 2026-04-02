@@ -175,12 +175,15 @@ class BrainsRouter:
                 answer = self._call_groq(messages)
                 model_used = "groq-llama-3.1-8b-instant"
 
-        # Append a clean Saved links section when link references were used
+        answer_stripped = (answer or "").strip()
+        if not re.match(r"^\s*answer\s*:", answer_stripped, re.IGNORECASE):
+            body = f"Answer:\n{answer_stripped}"
+        else:
+            body = answer_stripped
         if source_refs:
-            saved_links_block = "\n\nSaved links:\n" + "\n".join(source_refs)
-            answer = answer.rstrip() + saved_links_block
+            body = body.rstrip() + "\n\nSaved links:\n" + "\n".join(source_refs)
 
         return {
-            "answer": answer,
+            "answer": body,
             "model": model_used,
         }
