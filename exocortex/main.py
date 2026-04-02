@@ -44,6 +44,7 @@ def main() -> None:
         reflection=reflection,
         dashboard_secret=config.dashboard_secret,
         dashboard_users=config.dashboard_users,
+        dashboard_public_url=config.dashboard_public_url,
     )
     app.register_blueprint(api_bp)
 

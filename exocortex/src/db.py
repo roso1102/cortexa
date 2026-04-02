@@ -92,6 +92,8 @@ memories = Table(
     Column("source_url", Text, nullable=True),
     Column("text_fingerprint", String(64), nullable=True, index=True),
     Column("url_fingerprint", String(64), nullable=True, index=True),
+    Column("content_type", String(64), nullable=True, index=True),
+    Column("topics", JSON, nullable=True),
     Column("tags", JSON, nullable=True),
     Column("created_at_ts", BigInteger, nullable=False, index=True),
     Column("due_at_ts", BigInteger, nullable=True, index=True),

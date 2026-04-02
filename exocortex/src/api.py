@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict
 from urllib.parse import unquote
@@ -12,6 +14,30 @@ from werkzeug.security import check_password_hash
 from src.memory import MemoryManager
 from src.reflection import ReflectionService
 
+logger = logging.getLogger(__name__)
+
+# Werkzeug scrypt hashes look like: scrypt:32768:8:1$salt$hexdigest
+# Some clients/DB paths have stored parameters-only (missing "scrypt:"), which makes
+# werkzeug treat "32768" as the algorithm name and raise ValueError.
+_SCRYPARAMS_ONLY = re.compile(r"^\d+:\d+:\d+\$.+")
+
+def _coerce_stored_password_hash(stored: str) -> str:
+    p = (stored or "").strip()
+    if _SCRYPARAMS_ONLY.match(p) and not p.startswith("scrypt:"):
+        return f"scrypt:{p}"
+    return p
+
+
+def _password_ok(stored_hash: str, password: str) -> bool:
+    if not stored_hash or stored_hash == "!":
+        return False
+    pwhash = _coerce_stored_password_hash(stored_hash)
+    try:
+        return bool(check_password_hash(pwhash, password))
+    except ValueError as e:
+        logger.warning("password_hash verify failed (malformed hash?): %s", e)
+        return False
+
 
 def create_api_blueprint(
     *,
@@ -19,6 +45,7 @@ def create_api_blueprint(
     reflection: ReflectionService,
     dashboard_secret: str,
     dashboard_users: Dict[str, str],
+    dashboard_public_url: str = "",
 ) -> Blueprint:
     """
     JSON API for the Cortexa dashboard.
@@ -36,7 +63,7 @@ def create_api_blueprint(
     @bp.before_request
     def _auth() -> Any:
         # Login endpoint is unauthenticated
-        if request.path.endswith("/auth/login"):
+        if request.path.endswith("/auth/login") or request.path.endswith("/auth/telegram/start-link"):
             return None
 
         token = request.headers.get("X-Dashboard-Token", "").strip()
@@ -79,7 +106,7 @@ def create_api_blueprint(
             from src.db import get_user_by_chat_id
 
             user = get_user_by_chat_id(chat_id_int)
-            if not user or not check_password_hash(user.password_hash, password):
+            if not user or not _password_ok(user.password_hash, password):
                 return jsonify({"error": "invalid_credentials"}), 401
         except RuntimeError:
             expected = dashboard_users.get(raw_chat_id)
@@ -89,6 +116,24 @@ def create_api_blueprint(
         payload = {"user_id": chat_id_int, "chat_id": chat_id_int}
         token = serializer.dumps(payload)
         return jsonify({"token": token})
+
+    @bp.get("/auth/telegram/start-link")
+    def telegram_start_link() -> Any:
+        """
+        Build a dashboard login URL prefilled with Telegram chat_id from /start flow.
+        This removes the need for manual Telegram ID entry in the UI.
+        """
+        raw_chat_id = str(request.args.get("chat_id") or "").strip()
+        if not raw_chat_id:
+            return jsonify({"error": "missing_chat_id"}), 400
+        try:
+            int(raw_chat_id)
+        except ValueError:
+            return jsonify({"error": "invalid_chat_id"}), 400
+        base = (dashboard_public_url or "").strip().rstrip("/")
+        if not base:
+            return jsonify({"error": "dashboard_public_url_missing"}), 400
+        return jsonify({"url": f"{base}/login?chat_id={raw_chat_id}&source=telegram"})
 
     @bp.get("/memories")
     def get_memories() -> Any:  # noqa: C901

@@ -147,6 +147,15 @@ def route_action(text: str, groq_client: Groq) -> RoutedAction:
     if t.startswith(("save this", "save:", "note this", "note:", "log this", "journal this")) and "http" not in t:
         return RoutedAction(action=ACTION_SAVE_TEXT, confidence=0.9, reason="pre-check: explicit save", args={"text": raw_full})
 
+    # Fast-path: ambiguous short phrases should clarify instead of being silently saved.
+    if _looks_ambiguous_short_phrase(header):
+        return RoutedAction(
+            action=ACTION_CLARIFY,
+            confidence=0.5,
+            reason="pre-check: ambiguous short phrase",
+            args={"question": "Do you want me to save this, or answer a question about it?"},
+        )
+
     # Fast-path: generic memory listing (with optional kind/topic extraction).
     if _is_list_memory_query(t):
         args = _extract_list_memory_filters(t)
@@ -398,6 +407,26 @@ def _is_obvious_query(text: str) -> bool:
         return True
     if any(s in t for s in _QUERY_SUBSTRINGS):
         return True
+    return False
+
+
+def _looks_ambiguous_short_phrase(text: str) -> bool:
+    """
+    Short noun-phrases like 'screen recording' are often ambiguous and should clarify.
+    """
+    t = (text or "").strip().lower()
+    if not t or "\n" in t:
+        return False
+    if "http://" in t or "https://" in t:
+        return False
+    if t.endswith("?") or _is_obvious_query(t) or _is_list_memory_query(t) or _is_list_links_query(t):
+        return False
+    if _has_time_cue(t):
+        return False
+    tokens = re.findall(r"[a-z0-9]+", t)
+    if len(tokens) <= 3 and len(t) <= 40:
+        if not any(t.startswith(p) for p in ("save", "note", "log", "journal", "delete", "remove", "remind")):
+            return True
     return False
 
 

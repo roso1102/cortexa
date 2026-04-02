@@ -26,6 +26,8 @@ create table if not exists public.memories (
   source_url text null,
   text_fingerprint text null,
   url_fingerprint text null,
+  content_type text null,
+  topics jsonb null,
   tags jsonb null,
 
   created_at_ts bigint not null,
@@ -51,6 +53,9 @@ create index if not exists memories_chat_text_fp_idx
 
 create index if not exists memories_chat_url_fp_idx
   on public.memories (chat_id, url_fingerprint);
+
+create index if not exists memories_user_content_type_idx
+  on public.memories (user_id, content_type);
 
 create index if not exists memories_user_due_at_ts_idx
   on public.memories (user_id, due_at_ts);

@@ -205,12 +205,22 @@ class CortexaBot:
     async def handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
         if not update.effective_chat:
             return
+        chat_id = update.effective_chat.id
+        base = (self._config.dashboard_public_url or "").strip().rstrip("/")
+        login_link = f"{base}/login?chat_id={chat_id}&source=telegram" if base else ""
         text = (
-            "🧠 Welcome to cortexa.\n\n"
-            "Send me text, links, or PDFs to save them into your semantic memory.\n"
-            "Ask me questions in simple English and I'll answer using your past memories."
+            "Verification done. Welcome to cortexa.\n\n"
+            "What I can do:\n"
+            "- Save your notes, links, and PDFs\n"
+            "- Answer from your saved memories\n"
+            "- List saved items by topic/type\n"
+            "- Set reminders with explicit time\n"
+            "- Avoid duplicate saves and return existing links\n"
         )
-        await self._send_text(context, update.effective_chat.id, text)
+        if login_link:
+            text += f"\nOpen dashboard login:\n{login_link}\n\n"
+            text += "You don't need to manually enter Telegram ID; it is pre-filled from this chat."
+        await self._send_text(context, chat_id, text)
 
     async def handle_summary_today(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[type-arg]
         if not update.effective_chat:
@@ -320,6 +330,41 @@ class CortexaBot:
         if len(text.strip()) > 60:
             snippet += "..."
         return f'Got it. I\'ve saved "{snippet}" into your memory. You can ask me about it anytime.'
+
+    def _extract_topics(self, text: str, max_topics: int = 6) -> list[str]:
+        stop = {
+            "the", "and", "for", "with", "that", "this", "you", "your", "are", "was", "were", "can", "could",
+            "would", "should", "what", "when", "where", "why", "how", "me", "my", "in", "on", "to", "of", "a",
+            "an", "it", "i", "is", "do", "did", "does", "about",
+        }
+        toks = re.findall(r"[a-z0-9]{3,}", (text or "").lower())
+        out: list[str] = []
+        seen: set[str] = set()
+        for tok in toks:
+            if tok in stop or tok in seen:
+                continue
+            seen.add(tok)
+            out.append(tok)
+            if len(out) >= max_topics:
+                break
+        return out
+
+    def _infer_content_type(self, text: str, source_type: str) -> str:
+        st = (source_type or "").lower().strip()
+        if st == "link":
+            return "link"
+        if st == "pdf":
+            return "document"
+        if st == "reminder":
+            return "reminder"
+        t = (text or "").lower()
+        if len([ln for ln in t.splitlines() if ln.strip()]) >= 6:
+            return "poem"
+        if any(k in t for k in ("story", "once upon", "chapter", "narrative")):
+            return "story"
+        if any(k in t for k in ("news", "headline", "report", "breaking")):
+            return "news"
+        return "note"
 
     def _is_allowed(self, chat_id: int) -> bool:
         """Return True if this chat_id is permitted to use the bot."""
@@ -498,6 +543,8 @@ class CortexaBot:
                     str(m.get("title") or "").lower(),
                     str(m.get("raw_content") or "").lower(),
                     " ".join([str(t).lower() for t in (m.get("tags") or [])]),
+                    str(m.get("content_type") or "").lower(),
+                    " ".join([str(t).lower() for t in (m.get("topics") or [])]),
                     source_type.lower(),
                 ]
             )
@@ -530,6 +577,8 @@ class CortexaBot:
                         str(m.get("title") or "").lower(),
                         str(m.get("raw_content") or "").lower(),
                         " ".join([str(t).lower() for t in (m.get("tags") or [])]),
+                        str(m.get("content_type") or "").lower(),
+                        " ".join([str(t).lower() for t in (m.get("topics") or [])]),
                         source_type.lower(),
                     ]
                 )
@@ -614,6 +663,8 @@ class CortexaBot:
                 "text_fingerprint": self._text_fingerprint(text),
                 "url_fingerprint": self._url_fingerprint(source_url) if source_url else None,
                 "tags": base_meta.get("tags"),
+                "content_type": base_meta.get("content_type"),
+                "topics": base_meta.get("topics"),
                 "created_at_ts": int(base_meta.get("created_at_ts") or utc_now_ts()),
                 "due_at_ts": base_meta.get("due_at_ts"),
                 "last_accessed_ts": base_meta.get("last_accessed_ts"),
@@ -623,7 +674,15 @@ class CortexaBot:
                 "parent_id": base_meta.get("parent_id"),
                 "is_full": True,
             }
-            insert_memory(row)
+            try:
+                insert_memory(row)
+            except Exception:
+                # Backward compatibility: older DB schemas may not yet have
+                # content_type/topics/fingerprint columns.
+                row_fallback = dict(row)
+                for k in ("content_type", "topics", "text_fingerprint", "url_fingerprint"):
+                    row_fallback.pop(k, None)
+                insert_memory(row_fallback)
 
         # Store chunks only for long text
         chunk_rows: list[dict[str, Any]] = []
@@ -897,6 +956,13 @@ class CortexaBot:
         # --- Option B: Action router (feature-flagged) ---
         if use_action_router:
             routed = route_action(text, self._groq_client)
+            logger.info(
+                "router_decision chat_id=%s action=%s confidence=%.2f reason=%s",
+                chat_id,
+                routed.action,
+                float(routed.confidence or 0.0),
+                routed.reason,
+            )
             if self._debug_mode:
                 await self._send_text(
                     context,
@@ -942,7 +1008,13 @@ class CortexaBot:
                 reminder = parse_reminder_llm(text, self._groq_client)
                 if reminder:
                     meta = reminder_to_metadata(reminder, chat_id=chat_id)
-                    base_meta = {**meta, "source_type": "reminder", "user_id": chat_id}
+                    base_meta = {
+                        **meta,
+                        "source_type": "reminder",
+                        "user_id": chat_id,
+                        "content_type": "reminder",
+                        "topics": self._extract_topics(reminder.text),
+                    }
                     full_id = self._store_full_and_chunks(
                         text=reminder.text,
                         base_meta=base_meta,
@@ -1025,6 +1097,13 @@ class CortexaBot:
         # --- Legacy intent classifier path (default / fallback) ---
         intent_result = classify_intent(text, self._groq_client)
         intent = intent_result["intent"]
+        logger.info(
+            "legacy_intent chat_id=%s intent=%s confidence=%.2f source=%s",
+            chat_id,
+            intent,
+            float(intent_result.get("confidence") or 0.0),
+            intent_result.get("source"),
+        )
         legacy_urls = extract_urls(text)
         if intent == INTENT_INGEST_LINK and not legacy_urls and self._looks_like_general_query(text):
             intent = INTENT_QUERY
@@ -1235,6 +1314,8 @@ class CortexaBot:
                             "created_at": utc_now_iso(),
                             "created_at_ts": utc_now_ts(),
                             "tags": link_tags,
+                            "content_type": "link",
+                            "topics": self._extract_topics(f"{preferred_title} {extracted.text[:500]}"),
                             "priority_score": 0.5,
                         }
                         full_id = self._store_full_and_chunks(
@@ -1279,6 +1360,8 @@ class CortexaBot:
                                 "created_at": utc_now_iso(),
                                 "created_at_ts": utc_now_ts(),
                                 "tags": link_tags,
+                                "content_type": "link",
+                                "topics": self._extract_topics(title_guess),
                                 "priority_score": 0.5,
                                 "fetch_error": str(exc)[:200],
                             }
@@ -1380,6 +1463,8 @@ class CortexaBot:
             "created_at": utc_now_iso(),
             "created_at_ts": utc_now_ts(),
             "tags": tags,
+            "content_type": self._infer_content_type(text, "text"),
+            "topics": self._extract_topics(text),
             "priority_score": 0.5,
         }
         full_id = self._store_full_and_chunks(
@@ -1469,6 +1554,8 @@ class CortexaBot:
                 "created_at": utc_now_iso(),
                 "created_at_ts": utc_now_ts(),
                 "tags": pdf_tags,
+                "content_type": "document",
+                "topics": self._extract_topics((document.file_name or "") + " " + full_text[:800]),
                 "priority_score": 0.5,
             }
             full_id = self._store_full_and_chunks(

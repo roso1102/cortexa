@@ -5,6 +5,7 @@ import os
 from typing import Any
 
 from groq import Groq
+from dotenv import load_dotenv
 
 from src.config import load_config
 from src.orchestrator import route_action
@@ -19,6 +20,7 @@ def _load_cases(path: str) -> list[dict[str, Any]]:
 
 
 def main() -> None:
+    load_dotenv()
     config = load_config()
     client = Groq(api_key=config.groq_api_key)
 

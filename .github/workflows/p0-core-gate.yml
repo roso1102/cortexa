@@ -1,0 +1,39 @@
+name: p0-core-gate
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  eval-gate:
+    runs-on: ubuntu-latest
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      TELEGRAM_TOKEN: dummy
+      PINECONE_API_KEY: dummy
+      GOOGLE_API_KEY: dummy
+      OPENROUTER_API_KEY: dummy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install minimal gate dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install groq python-dotenv
+
+      - name: Compile sources
+        run: python -m compileall exocortex/src exocortex/scripts
+
+      - name: Run P0 gate
+        if: env.GROQ_API_KEY != ''
+        working-directory: exocortex
+        run: |
+          PYTHONPATH=. python scripts/eval_p0_core_gate.py
