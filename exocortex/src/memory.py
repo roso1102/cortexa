@@ -129,6 +129,13 @@ class MemoryManager:
         logger.debug("embed success (len=%d, dim=%d)", len(text), len(embedding))
         return embedding
 
+    def embed_for_tunnel(self, text: str) -> List[float]:
+        """
+        Public embedding entry for tunnel clustering (bounded text + Gemini vector).
+        Prefer this over touching _embed from other modules.
+        """
+        return self._embed(_prepare_embed_text(text or ""))
+
     def add_memory(self, text: str, metadata: Dict[str, Any]) -> str:
         embed_text = _prepare_embed_text(text)
         vector = self._embed(embed_text)

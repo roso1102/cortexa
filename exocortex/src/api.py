@@ -336,10 +336,117 @@ def create_api_blueprint(
         try:
             from src.db import fetch_tunnel_graph_for_user
 
-            payload = fetch_tunnel_graph_for_user(user_id=user_id, tunnel_id=tunnel_id)
+            min_bridge: float | None = None
+            raw_mb = request.args.get("min_bridge")
+            if raw_mb is not None and str(raw_mb).strip() != "":
+                try:
+                    min_bridge = float(raw_mb)
+                except ValueError:
+                    min_bridge = None
+            payload = fetch_tunnel_graph_for_user(
+                user_id=user_id, tunnel_id=tunnel_id, min_bridge=min_bridge
+            )
             return jsonify({"tunnel_id": tunnel_id, **payload})
         except Exception as exc:
             logger.exception("Failed to fetch tunnel graph user_id=%s tunnel_id=%s", user_id, tunnel_id)
+            return jsonify({"error": str(exc)}), 500
+
+    @bp.post("/tunnels/<tunnel_id>/edges/explain")
+    def explain_tunnel_edge(tunnel_id: str) -> Any:
+        user_id = int(getattr(g, "user_id", 0) or 0)
+        if not user_id:
+            return jsonify({"error": "unauthorized"}), 401
+        body = request.get_json(silent=True) or {}
+        id_a = str(body.get("from_memory_id") or "").strip()
+        id_b = str(body.get("to_memory_id") or "").strip()
+        if not id_a or not id_b:
+            return jsonify({"error": "missing_memory_ids"}), 400
+        if id_a == id_b:
+            return jsonify({"error": "invalid_pair"}), 400
+        try:
+            from src.db import (
+                fetch_tunnel_edge_rationale,
+                fetch_two_memories_for_user,
+                verify_both_memories_in_tunnel,
+            )
+            from src.tunnels import explain_tunnel_edge_openrouter
+
+            if not verify_both_memories_in_tunnel(
+                user_id=user_id,
+                tunnel_id=tunnel_id,
+                memory_id_a=id_a,
+                memory_id_b=id_b,
+            ):
+                return jsonify({"error": "not_in_tunnel"}), 403
+
+            ma, mb = fetch_two_memories_for_user(
+                user_id=user_id, memory_id_a=id_a, memory_id_b=id_b
+            )
+            if not ma or not mb:
+                return jsonify({"error": "memory_not_found"}), 404
+
+            openrouter_key = str(getattr(reflection, "_openrouter_api_key", "") or "").strip()
+            fallback_used = True
+            summary = ""
+            evidence: list[dict[str, str]] = []
+
+            if openrouter_key:
+                summary, evidence, fallback_used = explain_tunnel_edge_openrouter(
+                    openrouter_key,
+                    memory_a=ma,
+                    memory_b=mb,
+                )
+
+            if fallback_used or not summary.strip():
+                stored = fetch_tunnel_edge_rationale(
+                    user_id=user_id,
+                    tunnel_id=tunnel_id,
+                    from_memory_id=id_a,
+                    to_memory_id=id_b,
+                )
+                summary = stored or (
+                    "These memories were linked in this tunnel by similarity scoring; "
+                    "a detailed narrative explanation was not available."
+                )
+                evidence = []
+                fallback_used = True
+
+            return jsonify(
+                {
+                    "tunnel_id": tunnel_id,
+                    "from_memory_id": id_a,
+                    "to_memory_id": id_b,
+                    "summary": summary,
+                    "evidence": evidence,
+                    "fallback": fallback_used,
+                }
+            )
+        except Exception as exc:
+            logger.exception("explain_tunnel_edge failed user_id=%s tunnel_id=%s", user_id, tunnel_id)
+            return jsonify({"error": str(exc)}), 500
+
+    @bp.post("/tunnels/<tunnel_id>/rebuild-edges")
+    def rebuild_tunnel_edges_route(tunnel_id: str) -> Any:
+        user_id = int(getattr(g, "user_id", 0) or 0)
+        if not user_id:
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            from src.db import fetch_tunnel_core_tag
+            from src.tunnels import rebuild_tunnel_edges as run_rebuild_edges
+
+            core = fetch_tunnel_core_tag(user_id=user_id, tunnel_id=tunnel_id)
+            if core is None:
+                return jsonify({"error": "tunnel_not_found"}), 404
+
+            edge_count, tag = run_rebuild_edges(
+                memory,
+                user_id=user_id,
+                tunnel_id=tunnel_id,
+                core_tag=core,
+            )
+            return jsonify({"ok": True, "edge_count": edge_count, "core_tag": tag})
+        except Exception as exc:
+            logger.exception("rebuild_tunnel_edges failed user_id=%s tunnel_id=%s", user_id, tunnel_id)
             return jsonify({"error": str(exc)}), 500
 
     @bp.get("/profile")

@@ -19,7 +19,7 @@ For now we use SQLAlchemy Core for a lightweight, explicit schema.
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import (
     JSON,
@@ -681,6 +681,169 @@ def update_memory_tunnel_fields(*, user_id: int, memory_id: str, tunnel_id: str,
         conn.execute(sql, {"tunnel_id": tunnel_id, "tunnel_name": tunnel_name, "user_id": user_id, "memory_id": memory_id})
 
 
+def delete_tunnel_edges_for_tunnel(*, user_id: int, tunnel_id: str) -> None:
+    engine = get_engine()
+    sql = sa_text(
+        """
+        DELETE FROM tunnel_edges
+        WHERE user_id = :user_id AND tunnel_id = :tunnel_id
+        """
+    )
+    with engine.begin() as conn:
+        conn.execute(sql, {"user_id": user_id, "tunnel_id": tunnel_id})
+
+
+def fetch_tunnel_core_tag(*, user_id: int, tunnel_id: str) -> Optional[str]:
+    engine = get_engine()
+    sql = sa_text(
+        """
+        SELECT core_tag FROM tunnels
+        WHERE user_id = :user_id AND id = :tunnel_id
+        LIMIT 1
+        """
+    )
+    with engine.begin() as conn:
+        row = conn.execute(sql, {"user_id": user_id, "tunnel_id": tunnel_id}).fetchone()
+    if not row:
+        return None
+    raw = dict(row._mapping).get("core_tag")
+    if raw is None:
+        return "semantic"
+    s = str(raw).strip()
+    return s if s else "semantic"
+
+
+def fetch_tunnel_member_memories_for_edges(*, user_id: int, tunnel_id: str) -> List[Dict[str, Any]]:
+    """Member memories with fields needed to rebuild tunnel edges."""
+    engine = get_engine()
+    sql = sa_text(
+        """
+        SELECT
+          m.memory_id,
+          m.raw_content_full,
+          m.tags,
+          m.source_type,
+          m.created_at_ts
+        FROM tunnel_members tm
+        JOIN memories m ON m.memory_id = tm.memory_id
+        WHERE tm.user_id = :user_id
+          AND tm.tunnel_id = :tunnel_id
+        ORDER BY m.created_at_ts DESC
+        """
+    )
+    with engine.begin() as conn:
+        rows = conn.execute(sql, {"user_id": user_id, "tunnel_id": tunnel_id}).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r._mapping)
+        out.append(
+            {
+                "id": d.get("memory_id"),
+                "raw_content": d.get("raw_content_full"),
+                "tags": d.get("tags") or [],
+                "source_type": d.get("source_type"),
+                "created_at_ts": d.get("created_at_ts"),
+            }
+        )
+    return out
+
+
+def fetch_two_memories_for_user(
+    *, user_id: int, memory_id_a: str, memory_id_b: str
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    engine = get_engine()
+    sql = sa_text(
+        """
+        SELECT
+          memory_id,
+          title,
+          raw_content_full,
+          source_type,
+          tags,
+          created_at_ts
+        FROM memories
+        WHERE user_id = :user_id
+          AND memory_id IN (:id_a, :id_b)
+          AND is_full = true
+        """
+    )
+    with engine.begin() as conn:
+        rows = conn.execute(
+            sql, {"user_id": user_id, "id_a": memory_id_a, "id_b": memory_id_b}
+        ).fetchall()
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        d = dict(r._mapping)
+        mid = str(d.get("memory_id") or "")
+        by_id[mid] = {
+            "id": mid,
+            "memory_id": mid,
+            "title": d.get("title"),
+            "raw_content_full": d.get("raw_content_full"),
+            "source_type": d.get("source_type"),
+            "tags": d.get("tags") or [],
+            "created_at_ts": d.get("created_at_ts"),
+        }
+    return by_id.get(memory_id_a), by_id.get(memory_id_b)
+
+
+def verify_both_memories_in_tunnel(
+    *, user_id: int, tunnel_id: str, memory_id_a: str, memory_id_b: str
+) -> bool:
+    engine = get_engine()
+    sql = sa_text(
+        """
+        SELECT COUNT(*) AS c FROM tunnel_members
+        WHERE user_id = :user_id
+          AND tunnel_id = :tunnel_id
+          AND memory_id IN (:id_a, :id_b)
+        """
+    )
+    with engine.begin() as conn:
+        row = conn.execute(
+            sql, {"user_id": user_id, "tunnel_id": tunnel_id, "id_a": memory_id_a, "id_b": memory_id_b}
+        ).fetchone()
+    if not row:
+        return False
+    return int(dict(row._mapping).get("c") or 0) >= 2
+
+
+def fetch_tunnel_edge_rationale(
+    *,
+    user_id: int,
+    tunnel_id: str,
+    from_memory_id: str,
+    to_memory_id: str,
+) -> Optional[str]:
+    engine = get_engine()
+    sql = sa_text(
+        """
+        SELECT rationale FROM tunnel_edges
+        WHERE user_id = :user_id
+          AND tunnel_id = :tunnel_id
+          AND (
+            (from_memory_id = :a AND to_memory_id = :b)
+            OR (from_memory_id = :b AND to_memory_id = :a)
+          )
+        LIMIT 1
+        """
+    )
+    with engine.begin() as conn:
+        row = conn.execute(
+            sql,
+            {
+                "user_id": user_id,
+                "tunnel_id": tunnel_id,
+                "a": from_memory_id,
+                "b": to_memory_id,
+            },
+        ).fetchone()
+    if not row:
+        return None
+    r = dict(row._mapping).get("rationale")
+    return str(r).strip() if r else None
+
+
 def insert_tunnel_edges(
     *,
     tunnel_id: str,
@@ -757,9 +920,12 @@ def fetch_tunnels_for_user(*, user_id: int, limit: int = 30) -> List[Dict[str, A
     return out
 
 
-def fetch_tunnel_graph_for_user(*, user_id: int, tunnel_id: str) -> Dict[str, Any]:
+def fetch_tunnel_graph_for_user(
+    *, user_id: int, tunnel_id: str, min_bridge: Optional[float] = None
+) -> Dict[str, Any]:
     """
     Fetch a tunnel graph payload with memory nodes and semantic edges.
+    If min_bridge is set, drop edges with bridge_score strictly below it.
     """
     engine = get_engine()
     node_sql = sa_text(
@@ -827,6 +993,8 @@ def fetch_tunnel_graph_for_user(*, user_id: int, tunnel_id: str) -> Dict[str, An
                 "rationale": d.get("rationale") or "",
             }
         )
+    if min_bridge is not None and min_bridge > 0.0:
+        edges = [e for e in edges if float(e.get("bridge_score") or 0.0) >= min_bridge]
     return {"nodes": nodes, "edges": edges}
 
 

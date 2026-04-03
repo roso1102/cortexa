@@ -57,10 +57,22 @@ Build semantic tunnels that connect non-obvious but meaningful ideas, and explai
 
 | Variable | Default | Meaning |
 |----------|---------|--------|
-| `TUNNEL_MIN_MEMORIES` | `4` | Minimum memories that must share one tag token for a cluster to become a tunnel (clamped 3–100). |
-| `TUNNEL_MAX_MEMORIES_PER_TUNNEL` | `20` | After deduplication, at most this many memories are kept per tunnel, newest first (clamped 5–400). |
+| `TUNNEL_MIN_MEMORIES` | `4` | Minimum memories in one cluster for a tunnel (embedding or tag fallback; clamped 3–100). |
+| `TUNNEL_MAX_MEMORIES_PER_TUNNEL` | `20` | Max memories per tunnel, newest first (clamped 5–400). |
+| `TUNNEL_EMBED_MAX_MEMORIES` | `120` | Newest-first cap on how many memories get Gemini embeddings per formation run (clamped 20–400). |
+| `TUNNEL_CLUSTER_MIN_COSINE` | `0.72` | Minimum cosine similarity to seed for embedding-first greedy clustering (clamped 0.55–0.95). |
 
-Set these on Koyeb (backend). Example stricter tunnels: `TUNNEL_MIN_MEMORIES=5` and `TUNNEL_MAX_MEMORIES_PER_TUNNEL=12`.
+Set these on Koyeb (backend). Example stricter tunnels: `TUNNEL_MIN_MEMORIES=5`, `TUNNEL_MAX_MEMORIES_PER_TUNNEL=12`, `TUNNEL_CLUSTER_MIN_COSINE=0.78`.
+
+## HTTP API (dashboard contract)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/api/tunnels/<tunnel_id>/graph` | Memory `nodes` + `edges` (optional query `min_bridge=<float>` drops weaker edges). |
+| `POST` | `/api/tunnels/<tunnel_id>/edges/explain` | Body JSON `from_memory_id`, `to_memory_id`. Returns `summary`, `evidence` (quotes), `fallback`. |
+| `POST` | `/api/tunnels/<tunnel_id>/rebuild-edges` | Recomputes `tunnel_edges` from current tunnel members (same `X-Dashboard-Token` auth). |
+
+Embedding-first tunnels use ids like `tunnel_semantic_<ts>_<idx>` and `core_tag` `semantic`. If embedding fails or yields no clusters, formation falls back to tag-token clustering (legacy).
 
 ## Dashboard (required for a sane graph)
 
@@ -69,8 +81,9 @@ The “dozens of random nodes” view happens when the UI builds a graph from **
 **Do this instead:**
 
 1. On tunnel detail / semantic map, call **`GET /api/tunnels/<tunnel_id>/graph`** with `X-Dashboard-Token`.
-2. Render **only** `nodes` (memories) and **`edges`** (memory-to-memory links). Show `edge.rationale` on click or hover.
-3. Do **not** add extra graph nodes from `memory.tags` unless behind an explicit “Show tag nodes” toggle.
+2. Render **only** `nodes` (memories) and **`edges`** (memory-to-memory links). Use `edge.rationale` for a quick tooltip if desired.
+3. For **“See why they’re linked”**, `POST /api/tunnels/<tunnel_id>/edges/explain` with the same auth header and body `{ "from_memory_id": "...", "to_memory_id": "..." }`. Render `summary` and the quoted `evidence` array. If `fallback` is true, the backend used the stored edge rationale or a generic message.
+4. Do **not** add extra graph nodes from `memory.tags` unless behind an explicit “Show tag nodes” toggle.
 
 Until the dashboard uses this endpoint, the map can stay noisy regardless of backend tuning.
 
@@ -78,6 +91,9 @@ Until the dashboard uses this endpoint, the map can stay noisy regardless of bac
 - [x] Plan document created.
 - [x] OpenRouter naming hardening.
 - [x] Tunnel edge table + persistence.
-- [x] `GET /api/tunnels/<id>/graph` endpoint.
-- [x] Initial edge generation logic with rationale fallback.
-- [x] Phase 2 scoring controls: confidence threshold, source-type balancing, per-node degree cap.
+- [x] `GET /api/tunnels/<id>/graph` endpoint (+ optional `min_bridge`).
+- [x] Embedding-first clustering with tag-token fallback.
+- [x] Hybrid edge weights (cosine + lexical) with caps and degree limits.
+- [x] `POST .../edges/explain` with quote validation + stored-rationale fallback.
+- [x] `POST .../rebuild-edges`.
+- [x] Public `MemoryManager.embed_for_tunnel()` for tunnel-time embeddings.
