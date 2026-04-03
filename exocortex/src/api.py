@@ -87,6 +87,11 @@ def create_api_blueprint(
 
     @bp.before_request
     def _auth() -> Any:
+        # CORS preflight: browser sends OPTIONS without X-Dashboard-Token; must not 401
+        # or the real GET/POST never runs.
+        if request.method == "OPTIONS":
+            return None
+
         # Login endpoint is unauthenticated
         if request.path.endswith("/auth/login") or request.path.endswith("/auth/telegram/start-link"):
             return None
