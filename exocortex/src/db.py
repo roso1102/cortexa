@@ -577,7 +577,10 @@ def fetch_main_memories_for_user_for_tunnels(
             """
             SELECT
               memory_id,
+              title,
               raw_content_full,
+              source_url,
+              topics,
               tags,
               source_type,
               created_at_ts
@@ -596,7 +599,10 @@ def fetch_main_memories_for_user_for_tunnels(
             """
             SELECT
               memory_id,
+              title,
               raw_content_full,
+              source_url,
+              topics,
               tags,
               source_type,
               created_at_ts
@@ -618,7 +624,10 @@ def fetch_main_memories_for_user_for_tunnels(
         out.append(
             {
                 "id": d.get("memory_id"),
+                "title": d.get("title"),
                 "raw_content": d.get("raw_content_full"),
+                "source_url": d.get("source_url"),
+                "topics": d.get("topics"),
                 "tags": d.get("tags") or [],
                 "source_type": d.get("source_type"),
                 "created_at_ts": d.get("created_at_ts"),
@@ -766,7 +775,10 @@ def fetch_tunnel_member_memories_for_edges(*, user_id: int, tunnel_id: str) -> L
         """
         SELECT
           m.memory_id,
+          m.title,
           m.raw_content_full,
+          m.source_url,
+          m.topics,
           m.tags,
           m.source_type,
           m.created_at_ts
@@ -785,7 +797,10 @@ def fetch_tunnel_member_memories_for_edges(*, user_id: int, tunnel_id: str) -> L
         out.append(
             {
                 "id": d.get("memory_id"),
+                "title": d.get("title"),
                 "raw_content": d.get("raw_content_full"),
+                "source_url": d.get("source_url"),
+                "topics": d.get("topics"),
                 "tags": d.get("tags") or [],
                 "source_type": d.get("source_type"),
                 "created_at_ts": d.get("created_at_ts"),
@@ -804,6 +819,8 @@ def fetch_two_memories_for_user(
           memory_id,
           title,
           raw_content_full,
+          source_url,
+          topics,
           source_type,
           tags,
           created_at_ts
@@ -821,11 +838,15 @@ def fetch_two_memories_for_user(
     for r in rows:
         d = dict(r._mapping)
         mid = str(d.get("memory_id") or "")
+        body = d.get("raw_content_full")
         by_id[mid] = {
             "id": mid,
             "memory_id": mid,
             "title": d.get("title"),
-            "raw_content_full": d.get("raw_content_full"),
+            "raw_content": body,
+            "raw_content_full": body,
+            "source_url": d.get("source_url"),
+            "topics": d.get("topics"),
             "source_type": d.get("source_type"),
             "tags": d.get("tags") or [],
             "created_at_ts": d.get("created_at_ts"),

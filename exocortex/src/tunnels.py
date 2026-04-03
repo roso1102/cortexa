@@ -218,8 +218,64 @@ _TOKEN_STOP = frozenset(
         "com",
         "org",
         "www",
+        "bookmark",
+        "bookmarks",
+        "bookmarking",
     }
 )
+
+# Tags that cluster many unrelated "saved link" rows; keep tunnel tagging on substance.
+_TAG_CLUSTER_NOISE = frozenset({"bookmark", "bookmarks", "bookmarking"})
+
+
+def _topics_as_plain(topics: Any) -> str:
+    if topics is None:
+        return ""
+    if isinstance(topics, list):
+        parts: List[str] = []
+        for t in topics:
+            if isinstance(t, dict):
+                v = t.get("topic") or t.get("name") or t.get("label") or t.get("title")
+                if v:
+                    parts.append(str(v).strip())
+                elif t:
+                    try:
+                        parts.append(json.dumps(t, ensure_ascii=False)[:400])
+                    except (TypeError, ValueError):
+                        parts.append(str(t)[:400])
+            else:
+                s = str(t).strip()
+                if s:
+                    parts.append(s)
+        return " ".join(parts)
+    if isinstance(topics, dict):
+        vals = [str(v).strip() for v in topics.values() if v is not None and str(v).strip()]
+        return " ".join(vals)[:2000]
+    s = str(topics).strip()
+    return s
+
+
+def _tunnel_rich_text(m: Dict[str, Any]) -> str:
+    """
+    All user-visible substance for clustering, edges, and LLM excerpts:
+    title, enrichment topics, body text, and source URL when not already in the body.
+    """
+    title = str(m.get("title") or "").strip()
+    raw = str(
+        m.get("raw_content") or m.get("raw_content_full") or m.get("text") or ""
+    ).strip()
+    url = str(m.get("source_url") or "").strip()
+    topics = _topics_as_plain(m.get("topics"))
+    parts: List[str] = []
+    if title:
+        parts.append(title)
+    if topics:
+        parts.append(f"Topics: {topics}")
+    if raw:
+        parts.append(raw)
+    if url and url not in raw:
+        parts.append(url)
+    return "\n".join(parts).strip()
 
 
 def _cluster_tokens_from_tags(tags: Any) -> set[str]:
@@ -230,7 +286,7 @@ def _cluster_tokens_from_tags(tags: Any) -> set[str]:
     seq = tags if isinstance(tags, list) else [tags]
     for tag in seq:
         for tok in re.findall(r"[a-z0-9]+", str(tag).lower()):
-            if len(tok) >= 3 and tok not in _TOKEN_STOP:
+            if len(tok) >= 3 and tok not in _TOKEN_STOP and tok not in _TAG_CLUSTER_NOISE:
                 out.add(tok)
     return out
 
@@ -267,10 +323,10 @@ def _pair_similarity_scores(
     va = vec_by_id.get(a_id) if vec_by_id and a_id else None
     vb = vec_by_id.get(b_id) if vec_by_id and b_id else None
 
-    a_raw = str(a.get("raw_content") or "")
-    b_raw = str(b.get("raw_content") or "")
-    a_ctok = _content_tokens(a_raw)
-    b_ctok = _content_tokens(b_raw)
+    a_txt = _tunnel_rich_text(a)
+    b_txt = _tunnel_rich_text(b)
+    a_ctok = _content_tokens(a_txt)
+    b_ctok = _content_tokens(b_txt)
     a_ttok = _cluster_tokens_from_tags(a.get("tags") or [])
     b_ttok = _cluster_tokens_from_tags(b.get("tags") or [])
     content_j = _jaccard(a_ctok, b_ctok)
@@ -296,10 +352,10 @@ def _dedupe_memories_pool(memories: List[Dict[str, Any]]) -> List[Dict[str, Any]
     seen: set[str] = set()
     out: List[Dict[str, Any]] = []
     for m in memories:
-        key = str(m.get("raw_content") or "")[:50]
-        if key in seen:
+        mid = str(m.get("id") or m.get("memory_id") or "").strip()
+        if not mid or mid in seen:
             continue
-        seen.add(key)
+        seen.add(mid)
         out.append(m)
     out.sort(key=lambda x: int(x.get("created_at_ts") or 0), reverse=True)
     return out
@@ -311,11 +367,11 @@ def _embed_memories_map(memory: MemoryManager, mems: List[Dict[str, Any]]) -> Di
         mid = str(m.get("id") or "").strip()
         if not mid:
             continue
-        raw = str(m.get("raw_content") or "").strip()
-        if not raw:
+        blob = _tunnel_rich_text(m)
+        if not blob:
             continue
         try:
-            out[mid] = memory.embed_for_tunnel(raw)
+            out[mid] = memory.embed_for_tunnel(blob)
         except Exception as exc:
             logger.debug("tunnel embed skip memory_id=%s: %s", mid, exc)
     return out
@@ -440,8 +496,7 @@ def _create_single_tunnel(
 ) -> Dict[str, Any]:
     snippets_for_llm = []
     for m in unique_mems[:5]:
-        raw = str(m.get("raw_content") or "").strip()
-        snippets_for_llm.append(raw[:_SNIPPET_CHARS])
+        snippets_for_llm.append(_tunnel_rich_text(m)[:_SNIPPET_CHARS])
 
     tunnel_name, tunnel_reason = _name_tunnel_openrouter(openrouter_api_key, core_tag, snippets_for_llm)
     tunnel_name = _sanitize_tunnel_name(tunnel_name, snippets_for_llm, cluster_index)
@@ -521,7 +576,8 @@ def _form_tunnels_tag_fallback(
         if not mid:
             continue
         id_to_memory[mid] = m
-        tokens = _cluster_tokens_from_tags(m.get("tags") or [])
+        tokens = set(_cluster_tokens_from_tags(m.get("tags") or []))
+        tokens |= _content_tokens(_tunnel_rich_text(m))
         if not tokens:
             continue
         for tok in tokens:
@@ -552,10 +608,10 @@ def _form_tunnels_tag_fallback(
         seen: set[str] = set()
         unique_mems: List[Dict[str, Any]] = []
         for m in tag_memories:
-            key = str(m.get("raw_content") or "")[:50]
-            if key in seen:
+            mid = str(m.get("id") or "").strip()
+            if not mid or mid in seen:
                 continue
-            seen.add(key)
+            seen.add(mid)
             unique_mems.append(m)
 
         unique_mems.sort(key=lambda m: int(m.get("created_at_ts") or 0), reverse=True)
@@ -717,8 +773,8 @@ def explain_tunnel_edge_openrouter(
     """
     id_a = str(memory_a.get("id") or memory_a.get("memory_id") or "")
     id_b = str(memory_b.get("id") or memory_b.get("memory_id") or "")
-    text_a = str(memory_a.get("raw_content") or memory_a.get("raw_content_full") or "")
-    text_b = str(memory_b.get("raw_content") or memory_b.get("raw_content_full") or "")
+    text_a = _tunnel_rich_text(memory_a)
+    text_b = _tunnel_rich_text(memory_b)
     ex_a = text_a[:excerpt_chars]
     ex_b = text_b[:excerpt_chars]
 
