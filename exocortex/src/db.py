@@ -889,19 +889,32 @@ def update_memory_last_resurfaced_ts(*, user_id: int, memory_id: str, last_resur
         conn.execute(sql, {"ts": last_resurfaced_ts, "user_id": user_id, "memory_id": memory_id})
 
 
-def fetch_tunnels_for_user(*, user_id: int, limit: int = 30) -> List[Dict[str, Any]]:
+def fetch_tunnels_for_user(
+    *,
+    user_id: int,
+    limit: int = 30,
+    min_memory_count: int = 4,
+) -> List[Dict[str, Any]]:
     engine = get_engine()
     sql = sa_text(
         """
         SELECT id, name, reason, core_tag, memory_count, created_at_ts, raw
         FROM tunnels
         WHERE user_id = :user_id
+          AND COALESCE(memory_count, 0) >= :min_memory_count
         ORDER BY created_at_ts DESC
         LIMIT :limit
         """
     )
     with engine.begin() as conn:
-        rows = conn.execute(sql, {"user_id": user_id, "limit": limit}).fetchall()
+        rows = conn.execute(
+            sql,
+            {
+                "user_id": user_id,
+                "limit": limit,
+                "min_memory_count": max(0, int(min_memory_count)),
+            },
+        ).fetchall()
     out: List[Dict[str, Any]] = []
     for r in rows:
         d = dict(r._mapping)

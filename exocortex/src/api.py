@@ -270,17 +270,35 @@ def create_api_blueprint(
 
     @bp.get("/tunnels")
     def get_tunnels() -> Any:
+        user_id = int(getattr(g, "user_id", 0) or 0)
         try:
+            raw_min = request.args.get("min_memory_count", "4")
+            try:
+                min_mc = max(0, int(str(raw_min).strip()))
+            except ValueError:
+                min_mc = 4
             from src.db import fetch_tunnels_for_user
 
-            tunnels = fetch_tunnels_for_user(user_id=int(getattr(g, "user_id", 0)), limit=30)
+            tunnels = fetch_tunnels_for_user(
+                user_id=user_id,
+                limit=30,
+                min_memory_count=min_mc,
+            )
         except Exception:
             # Fallback: legacy Pinecone tunnel objects (if Postgres not configured yet)
             tunnels = memory.query_by_filter(
                 query_text="tunnels themes clusters",
                 filter_obj={"source_type": {"$eq": "tunnel"}},
-                k=30,
+                k=60,
             )
+            try:
+                raw_min = request.args.get("min_memory_count", "4")
+                min_mc = max(0, int(str(raw_min).strip()))
+            except ValueError:
+                min_mc = 4
+            if min_mc > 0:
+                tunnels = [t for t in tunnels if int(t.get("memory_count") or 0) >= min_mc]
+            tunnels = tunnels[:30]
         return jsonify({"tunnels": tunnels})
 
     @bp.post("/tunnels/generate")

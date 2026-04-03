@@ -48,9 +48,9 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _tunnel_min_memories() -> int:
-    """Minimum memories sharing a tag token required to form one tunnel cluster."""
+    """Minimum memories per tunnel cluster (embedding or tag fallback). Hard floor 4."""
     v = _env_int("TUNNEL_MIN_MEMORIES", 4)
-    return max(3, min(v, 100))
+    return max(4, min(v, 100))
 
 
 def _tunnel_max_memories_per_tunnel() -> int:
