@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict
 from urllib.parse import unquote
@@ -81,6 +82,8 @@ def create_api_blueprint(
     CORS(bp)  # token auth still required; CORS just enables browser requests
 
     serializer = URLSafeTimedSerializer(dashboard_secret or "cortexa-dashboard", salt="cortexa-dashboard")
+    _tunnel_lock = threading.Lock()
+    _tunnel_runs_in_progress: set[int] = set()
 
     @bp.before_request
     def _auth() -> Any:
@@ -274,6 +277,51 @@ def create_api_blueprint(
                 k=30,
             )
         return jsonify({"tunnels": tunnels})
+
+    @bp.post("/tunnels/generate")
+    def generate_tunnels_now() -> Any:
+        """
+        Manually trigger tunnel formation for the authenticated user.
+        Returns newly generated tunnel metadata.
+        """
+        user_id = int(getattr(g, "user_id", 0) or 0)
+        if not user_id:
+            return jsonify({"error": "unauthorized"}), 401
+
+        with _tunnel_lock:
+            if user_id in _tunnel_runs_in_progress:
+                return jsonify({"error": "generation_in_progress"}), 409
+            _tunnel_runs_in_progress.add(user_id)
+
+        try:
+            from src.tunnels import form_tunnels
+
+            # Reuse already-initialized clients from ReflectionService.
+            groq_client = getattr(reflection, "_groq", None)
+            openrouter_key = str(getattr(reflection, "_openrouter_api_key", "") or "")
+            if groq_client is None:
+                return jsonify({"error": "groq_client_unavailable"}), 503
+
+            tunnels = form_tunnels(
+                memory,
+                groq_client,
+                user_id=user_id,
+                openrouter_api_key=openrouter_key,
+            )
+            return jsonify(
+                {
+                    "ok": True,
+                    "count": len(tunnels),
+                    "tunnels": tunnels,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        except Exception as exc:
+            logger.exception("Manual tunnel generation failed for user_id=%s", user_id)
+            return jsonify({"error": str(exc)}), 500
+        finally:
+            with _tunnel_lock:
+                _tunnel_runs_in_progress.discard(user_id)
 
     @bp.get("/profile")
     def get_profile() -> Any:
