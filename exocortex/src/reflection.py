@@ -37,17 +37,17 @@ class ReflectionService:
         if not t:
             return ""
         t = re.sub(r"[*_`#>]+", "", t)
-        lines: List[str] = []
+        parts: List[str] = []
         for ln in t.splitlines():
             s = re.sub(r"\s+", " ", ln).strip()
             if not s:
                 continue
-            # normalize common bullet prefixes
+            # normalize common list prefixes from model output
             s = re.sub(r"^[-•\d\.\)\s]+", "", s).strip()
             if not s:
                 continue
-            lines.append(f"- {s}")
-        return "\n".join(lines[:6])
+            parts.append(s)
+        return "\n".join(parts[:6])
 
     def _memory_clue(self, m: Dict[str, Any]) -> str:
         title = str(m.get("title") or "").strip()
@@ -81,7 +81,7 @@ class ReflectionService:
             if picked is None:
                 continue
             clue = self._memory_clue(picked)
-            lines.append(f"- Around {topic}, you saved: {clue}.")
+            lines.append(f"Around {topic}, you saved {clue}.")
             if len(lines) >= 5:
                 break
 
@@ -89,8 +89,8 @@ class ReflectionService:
             for m in contexts[:4]:
                 clue = self._memory_clue(m)
                 if clue:
-                    lines.append(f"- You saved: {clue}.")
-        return "\n".join(lines[:6])
+                    lines.append(f"You saved {clue}.")
+        return " ".join(lines[:6])
 
     def _topic_lines_summary(
         self,
@@ -106,21 +106,27 @@ class ReflectionService:
         top_topics = [str(t) for t, _ in tag_counter.most_common(5) if str(t).strip()]
         if not top_topics:
             top_topics = ["today's main ideas"]
-        joined = "\n\n---\n\n".join(todays_texts[:18])
+        # Build compact, per-memory snippets so long single memories don't dominate.
+        clue_items: List[str] = []
+        for idx, m in enumerate(contexts[:14], start=1):
+            clue = self._memory_clue(m)
+            if not clue:
+                continue
+            st = str(m.get("source_type") or "memory")
+            clue_items.append(f"{idx}. [{st}] {clue}")
+        joined = "\n".join(clue_items) if clue_items else "\n\n---\n\n".join(todays_texts[:10])
         topic_block = ", ".join(top_topics)
         prompt = (
-            "You are Exocortex, writing a personal end-of-day reflection for the user.\n"
-            "Write 3-6 bullet lines, each exactly ONE line, each line tied to a distinct topic.\n"
+            "You are Exocortex, writing a personal end-of-day diary reflection for the user.\n"
+            "Write one short diary-style paragraph (4-7 sentences), human and intuitive.\n"
             "Use second person (you/your), introspective tone, concise and specific.\n"
+            "You MUST reference several different saved items from the day (not just one).\n"
             "Use concrete wording from saved content (titles/phrases), avoid vague abstraction.\n"
-            "Output plain text only. No markdown emphasis, no headings, no code formatting.\n\n"
+            "Output plain text only. No markdown emphasis, no headings, no bullets, no numbering.\n\n"
             f"Top topics today: {topic_block}\n\n"
-            "Memories from today:\n"
+            "Saved items from today:\n"
             f"{joined}\n\n"
-            "Output format strictly:\n"
-            "- <topic insight line>\n"
-            "- <topic insight line>\n"
-            "..."
+            "Write as a diary note addressed to the user."
         )
 
         # 1) OpenRouter first (better reflective style consistency for this task)
@@ -136,7 +142,7 @@ class ReflectionService:
                 if content:
                     cleaned = self._clean_summary_text(content)
                     if cleaned:
-                        return cleaned
+                        return re.sub(r"\s*\n+\s*", " ", cleaned).strip()
             except Exception:
                 pass
 
@@ -152,7 +158,7 @@ class ReflectionService:
             if content:
                 cleaned = self._clean_summary_text(content)
                 if cleaned:
-                    return cleaned
+                    return re.sub(r"\s*\n+\s*", " ", cleaned).strip()
         except Exception:
             pass
 
