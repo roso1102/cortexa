@@ -898,11 +898,24 @@ def fetch_tunnels_for_user(
     engine = get_engine()
     sql = sa_text(
         """
-        SELECT id, name, reason, core_tag, memory_count, created_at_ts, raw
-        FROM tunnels
-        WHERE user_id = :user_id
-          AND COALESCE(memory_count, 0) >= :min_memory_count
-        ORDER BY created_at_ts DESC
+        SELECT
+          t.id,
+          t.name,
+          t.reason,
+          t.core_tag,
+          m.c AS memory_count,
+          t.created_at_ts,
+          t.raw
+        FROM tunnels t
+        INNER JOIN (
+          SELECT tunnel_id, COUNT(*)::integer AS c
+          FROM tunnel_members
+          WHERE user_id = :user_id
+          GROUP BY tunnel_id
+        ) m ON m.tunnel_id = t.id
+        WHERE t.user_id = :user_id
+          AND m.c >= :min_memory_count
+        ORDER BY t.created_at_ts DESC
         LIMIT :limit
         """
     )
