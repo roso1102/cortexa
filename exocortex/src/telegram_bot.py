@@ -696,10 +696,17 @@ class CortexaBot:
                     row_fallback.pop(k, None)
                 insert_memory(row_fallback)
 
-        # Store chunks only for long text
+        # Store chunks only for long text.
+        # Note: chunks are currently excluded from the main semantic recall path
+        # (see MemoryManager.is_main_memory and callers). Keeping a small number
+        # of chunks can still help for future retrieval/listing strategies, but
+        # we must cap cost for very large extracted pages.
         chunk_rows: list[dict[str, Any]] = []
         if len(text) > 900:
-            chunks = chunk_text(text)[:30]
+            max_chunk_source_chars = int(os.getenv("MAX_CHUNK_SOURCE_CHARS", "20000"))
+            max_chunks = int(os.getenv("MAX_CHUNKS_PER_SAVE", "6"))
+            text_for_chunks = text[:max_chunk_source_chars]
+            chunks = chunk_text(text_for_chunks)[:max_chunks]
             for idx, chunk in enumerate(chunks):
                 child_meta = {
                     **base_meta,

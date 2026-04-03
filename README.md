@@ -482,10 +482,12 @@ Long polling (`run_polling`) allows **exactly one** process (worldwide) to call 
 
 **Common causes**
 
-- **Multiple Heroku web dynos** (`web=2+`). Fix: `heroku ps:scale web=1` for this app, or use webhooks later.
-- **Same token in two places** (Heroku + local `python main.py`, second app, another machine). Fix: stop the extra process or use a **dev bot** with a separate token.
+This is **not** about how many *people* use the bot—it is about how many *server processes* poll Telegram with the same token.
 
-**Quick checks:** `heroku ps` shows one `web` dyno; no local bot using production `TELEGRAM_TOKEN`. Brief 409s during deploy usually clear after the old dyno stops.
+- **More than one app instance (replica)** on any host (e.g. Koyeb/Railway/Fly/Heroku with **instances > 1** or autoscaling). Fix: set **exactly 1 instance / 1 replica** for the service that runs `main.py`, or move to webhooks.
+- **Same token in two deployments** (two Koyeb services, prod + stale preview, or a local `python main.py` while Koyeb is live). Fix: stop the extra deployment or use a **separate bot token** for local dev.
+
+**Quick checks:** In your PaaS dashboard, confirm **one** running instance for this service; search for a second service or old deployment using the same `TELEGRAM_TOKEN`. Brief 409s during a rolling deploy can happen until the old instance stops.
 
 ### Regression gate command
 

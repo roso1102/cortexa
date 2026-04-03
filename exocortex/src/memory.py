@@ -23,6 +23,35 @@ _embed_cache_order: List[str] = []
 # lives in Postgres.
 _MAX_RAW_CONTENT_METADATA_CHARS = 20000
 
+# Embed budget: long extracted pages can be very large (tens of thousands of chars).
+# We still store the full canonical content in Postgres, but for Pinecone embeddings we
+# cap the amount of text to control cost/latency and reduce provider rate-limit risk.
+#
+# Default 20k aligns with our Pinecone metadata cap so embeddings and snippets remain
+# broadly consistent.
+_MAX_EMBED_CHARS = int(os.getenv("MAX_EMBED_CHARS", "20000"))
+_EMBED_HEAD_TAIL = os.getenv("EMBED_HEAD_TAIL", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+# Embed helper: cap long extracted pages for embedding cost control.
+def _prepare_embed_text(text: str) -> str:
+    """
+    Prepare bounded text for embeddings.
+
+    If the text is long, we optionally embed both the head and tail so retrieval
+    can still work when the most relevant info is near the end.
+    """
+    t = text or ""
+    if _MAX_EMBED_CHARS <= 0 or len(t) <= _MAX_EMBED_CHARS:
+        return t
+    if not _EMBED_HEAD_TAIL:
+        return t[:_MAX_EMBED_CHARS]
+
+    head_len = _MAX_EMBED_CHARS // 2
+    tail_len = _MAX_EMBED_CHARS - head_len
+    head = t[:head_len]
+    tail = t[-tail_len:] if tail_len > 0 else ""
+    return head + "\n\n[TRUNCATED_TAIL]\n\n" + tail
+
 # Back-off state: when a 429 quota error is hit, stop embedding for this many
 # seconds so we don't burn the remaining daily quota in a tight retry loop.
 _QUOTA_BACKOFF_SECS = 120
@@ -101,7 +130,8 @@ class MemoryManager:
         return embedding
 
     def add_memory(self, text: str, metadata: Dict[str, Any]) -> str:
-        vector = self._embed(text)
+        embed_text = _prepare_embed_text(text)
+        vector = self._embed(embed_text)
         memory_id = metadata.get("id") or utc_now_iso()
 
         # Truncate raw_content stored inside Pinecone metadata so we don't
