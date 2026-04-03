@@ -769,6 +769,7 @@ def fetch_tunnel_graph_for_user(*, user_id: int, tunnel_id: str) -> Dict[str, An
           m.title,
           m.raw_content_full,
           m.tags,
+          m.source_type,
           m.created_at_ts
         FROM tunnel_members tm
         JOIN memories m ON m.memory_id = tm.memory_id
@@ -809,6 +810,7 @@ def fetch_tunnel_graph_for_user(*, user_id: int, tunnel_id: str) -> Dict[str, An
                 "title": d.get("title") or "",
                 "snippet": raw[:280],
                 "tags": d.get("tags") or [],
+                "source_type": d.get("source_type") or "",
                 "created_at_ts": d.get("created_at_ts"),
             }
         )

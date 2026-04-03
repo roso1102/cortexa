@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import json
+import os
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -42,6 +43,29 @@ from src.utils import utc_now_iso, utc_now_ts
 
 logger = logging.getLogger(__name__)
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _tunnel_min_memories() -> int:
+    """Minimum memories sharing a tag token required to form one tunnel cluster."""
+    v = _env_int("TUNNEL_MIN_MEMORIES", 4)
+    return max(3, min(v, 100))
+
+
+def _tunnel_max_memories_per_tunnel() -> int:
+    """Cap memories assigned to a single tunnel (newest first) to keep graphs readable."""
+    v = _env_int("TUNNEL_MAX_MEMORIES_PER_TUNNEL", 20)
+    return max(5, min(v, 400))
+
+
 _TUNNEL_NAMER_PROMPT = """\
 You are Exocortex. Below are 3-5 short memory snippets that share a common theme.
 
@@ -53,7 +77,6 @@ Snippets:
 {snippets}
 """
 
-_MIN_MEMORIES_FOR_TUNNEL = 3  # skip clusters with too few memories
 _MAX_TUNNELS = 8               # avoid tunnel explosion
 _SNIPPET_CHARS = 200           # max chars per snippet sent to LLM
 _MAX_EDGE_NODES = 12           # cap pairwise comparisons to keep latency bounded
@@ -260,7 +283,13 @@ def form_tunnels(memory: MemoryManager, groq: Groq, *, user_id: int, openrouter_
 
     Returns a list of tunnel dicts that were created (or updated).
     """
-    logger.info("Starting tunnel formation")
+    min_mem = _tunnel_min_memories()
+    max_mem = _tunnel_max_memories_per_tunnel()
+    logger.info(
+        "Starting tunnel formation (min_memories=%s max_memories_per_tunnel=%s)",
+        min_mem,
+        max_mem,
+    )
     # Prefer canonical Postgres memories (prevents chunk/tunnel leakage and improves accuracy).
     try:
         memories = fetch_main_memories_for_user_for_tunnels(
@@ -307,14 +336,14 @@ def form_tunnels(memory: MemoryManager, groq: Groq, *, user_id: int, openrouter_
 
     qualified_tags: Dict[str, List[Dict[str, Any]]] = {}
     for tok, ids in token_to_ids.items():
-        if len(ids) < _MIN_MEMORIES_FOR_TUNNEL:
+        if len(ids) < min_mem:
             continue
         qualified_tags[tok] = [id_to_memory[i] for i in ids if i in id_to_memory]
 
     if not qualified_tags:
         logger.info(
             "Not enough overlapping tag tokens to form tunnels (need >= %d memories sharing one token)",
-            _MIN_MEMORIES_FOR_TUNNEL,
+            min_mem,
         )
         return []
 
@@ -337,6 +366,10 @@ def form_tunnels(memory: MemoryManager, groq: Groq, *, user_id: int, openrouter_
             if key not in seen:
                 seen.add(key)
                 unique_mems.append(m)
+
+        # Newest first, then cap so tunnels stay small enough for readable graphs.
+        unique_mems.sort(key=lambda m: int(m.get("created_at_ts") or 0), reverse=True)
+        unique_mems = unique_mems[:max_mem]
 
         # Build representative snippets for naming
         snippets_for_llm = []

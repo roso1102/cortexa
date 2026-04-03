@@ -53,6 +53,27 @@ Build semantic tunnels that connect non-obvious but meaningful ideas, and explai
   - metrics for edge acceptance, fallback rate, empty-response rate
   - admin debug endpoint for tunnel diagnostics
 
+## Environment variables (tunnel formation)
+
+| Variable | Default | Meaning |
+|----------|---------|--------|
+| `TUNNEL_MIN_MEMORIES` | `4` | Minimum memories that must share one tag token for a cluster to become a tunnel (clamped 3–100). |
+| `TUNNEL_MAX_MEMORIES_PER_TUNNEL` | `20` | After deduplication, at most this many memories are kept per tunnel, newest first (clamped 5–400). |
+
+Set these on Koyeb (backend). Example stricter tunnels: `TUNNEL_MIN_MEMORIES=5` and `TUNNEL_MAX_MEMORIES_PER_TUNNEL=12`.
+
+## Dashboard (required for a sane graph)
+
+The “dozens of random nodes” view happens when the UI builds a graph from **every tag, word, URL, or entity** extracted from a few memories. That is not the tunnel graph.
+
+**Do this instead:**
+
+1. On tunnel detail / semantic map, call **`GET /api/tunnels/<tunnel_id>/graph`** with `X-Dashboard-Token`.
+2. Render **only** `nodes` (memories) and **`edges`** (memory-to-memory links). Show `edge.rationale` on click or hover.
+3. Do **not** add extra graph nodes from `memory.tags` unless behind an explicit “Show tag nodes” toggle.
+
+Until the dashboard uses this endpoint, the map can stay noisy regardless of backend tuning.
+
 ## Immediate Implementation Started
 - [x] Plan document created.
 - [x] OpenRouter naming hardening.
