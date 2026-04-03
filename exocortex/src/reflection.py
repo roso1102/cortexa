@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Any, Dict, List
 
 from groq import Groq
@@ -26,9 +27,75 @@ class ReflectionService:
             else None
         )
 
+    def _clean_summary_text(self, text: str) -> str:
+        """
+        Dashboard-safe plain text cleanup:
+        - strips markdown emphasis/code/header markers
+        - keeps simple one-line bullets
+        """
+        t = (text or "").strip()
+        if not t:
+            return ""
+        t = re.sub(r"[*_`#>]+", "", t)
+        lines: List[str] = []
+        for ln in t.splitlines():
+            s = re.sub(r"\s+", " ", ln).strip()
+            if not s:
+                continue
+            # normalize common bullet prefixes
+            s = re.sub(r"^[-•\d\.\)\s]+", "", s).strip()
+            if not s:
+                continue
+            lines.append(f"- {s}")
+        return "\n".join(lines[:6])
+
+    def _memory_clue(self, m: Dict[str, Any]) -> str:
+        title = str(m.get("title") or "").strip()
+        raw = str(m.get("raw_content") or "").strip()
+        if title:
+            return title[:100]
+        first = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
+        if first.lower().startswith("title:"):
+            first = first.split(":", 1)[1].strip()
+        return re.sub(r"\s+", " ", first)[:100] if first else "a saved memory"
+
+    def _deterministic_topic_lines(self, contexts: List[Dict[str, Any]], tag_counter: Counter) -> str:
+        lines: List[str] = []
+        top_topics = [str(t).strip() for t, _ in tag_counter.most_common(5) if str(t).strip()]
+        used_ids: set[str] = set()
+        for topic in top_topics:
+            topic_l = topic.lower()
+            picked: Dict[str, Any] | None = None
+            for m in contexts:
+                mid = str(m.get("id") or "")
+                if mid and mid in used_ids:
+                    continue
+                tags = " ".join(str(t).lower() for t in (m.get("tags") or []))
+                raw = str(m.get("raw_content") or "").lower()
+                title = str(m.get("title") or "").lower()
+                if topic_l in tags or topic_l in raw or topic_l in title:
+                    picked = m
+                    if mid:
+                        used_ids.add(mid)
+                    break
+            if picked is None:
+                continue
+            clue = self._memory_clue(picked)
+            lines.append(f"- Around {topic}, you saved: {clue}.")
+            if len(lines) >= 5:
+                break
+
+        if not lines:
+            for m in contexts[:4]:
+                clue = self._memory_clue(m)
+                if clue:
+                    lines.append(f"- You saved: {clue}.")
+        return "\n".join(lines[:6])
+
     def _topic_lines_summary(
         self,
         *,
+        contexts: List[Dict[str, Any]],
         todays_texts: List[str],
         tag_counter: Counter,
     ) -> str:
@@ -45,7 +112,8 @@ class ReflectionService:
             "You are Exocortex, writing a personal end-of-day reflection for the user.\n"
             "Write 3-6 bullet lines, each exactly ONE line, each line tied to a distinct topic.\n"
             "Use second person (you/your), introspective tone, concise and specific.\n"
-            "No preamble, no title, no numbering.\n\n"
+            "Use concrete wording from saved content (titles/phrases), avoid vague abstraction.\n"
+            "Output plain text only. No markdown emphasis, no headings, no code formatting.\n\n"
             f"Top topics today: {topic_block}\n\n"
             "Memories from today:\n"
             f"{joined}\n\n"
@@ -66,7 +134,9 @@ class ReflectionService:
                 )
                 content = (chat.choices[0].message.content or "").strip()
                 if content:
-                    return content
+                    cleaned = self._clean_summary_text(content)
+                    if cleaned:
+                        return cleaned
             except Exception:
                 pass
 
@@ -80,23 +150,14 @@ class ReflectionService:
             )
             content = (chat.choices[0].message.content or "").strip()
             if content:
-                return content
+                cleaned = self._clean_summary_text(content)
+                if cleaned:
+                    return cleaned
         except Exception:
             pass
 
-        # 3) Deterministic fallback: never return unavailable
-        lines: List[str] = []
-        for topic, _ in tag_counter.most_common(4):
-            t = str(topic).strip()
-            if not t:
-                continue
-            lines.append(f"- You kept coming back to {t}, and it looks like this is becoming part of your core thinking.")
-        if not lines:
-            lines = [
-                "- You captured meaningful ideas today; your notes show steady curiosity and momentum.",
-                "- You are building continuity in your thinking by turning scattered inputs into saved memory.",
-            ]
-        return "\n".join(lines)
+        # 3) Deterministic fallback: concrete and grounded in actual saves.
+        return self._deterministic_topic_lines(contexts, tag_counter)
 
     def summarize_today(self) -> str:
         """
@@ -159,7 +220,7 @@ class ReflectionService:
         if not todays_texts:
             return header
 
-        llm_summary = self._topic_lines_summary(todays_texts=todays_texts, tag_counter=tag_counter)
+        llm_summary = self._topic_lines_summary(contexts=contexts, todays_texts=todays_texts, tag_counter=tag_counter)
 
         return f"{header}\n\n{llm_summary}"
 
@@ -236,7 +297,7 @@ class ReflectionService:
         if not todays_texts:
             return header
 
-        llm_summary = self._topic_lines_summary(todays_texts=todays_texts, tag_counter=tag_counter)
+        llm_summary = self._topic_lines_summary(contexts=contexts, todays_texts=todays_texts, tag_counter=tag_counter)
 
         return f"{header}\n\n{llm_summary}"
 
