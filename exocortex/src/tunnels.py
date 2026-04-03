@@ -21,9 +21,11 @@ Strategy:
 from __future__ import annotations
 
 import logging
+import json
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
+from itertools import combinations
 from typing import Any, Dict, List
 
 from groq import Groq
@@ -33,6 +35,7 @@ from src.memory import MemoryManager
 from src.db import (
     fetch_main_memories_for_user_for_tunnels,
     insert_tunnel_and_members,
+    insert_tunnel_edges,
     update_memory_tunnel_fields,
 )
 from src.utils import utc_now_iso, utc_now_ts
@@ -53,6 +56,10 @@ Snippets:
 _MIN_MEMORIES_FOR_TUNNEL = 3  # skip clusters with too few memories
 _MAX_TUNNELS = 8               # avoid tunnel explosion
 _SNIPPET_CHARS = 200           # max chars per snippet sent to LLM
+_MAX_EDGE_NODES = 12           # cap pairwise comparisons to keep latency bounded
+_MAX_EDGES_PER_TUNNEL = 18
+_MAX_DEGREE_PER_NODE = 4       # avoid hub-and-spoke explosion in graph UI
+_MIN_EDGE_CONFIDENCE = 0.08    # drop weak links
 
 # Drop generic tokens so we do not form giant "the" / "note" tunnels.
 _TOKEN_STOP = frozenset(
@@ -149,6 +156,102 @@ def _cluster_tokens_from_tags(tags: Any) -> set[str]:
             if len(tok) >= 3 and tok not in _TOKEN_STOP:
                 out.add(tok)
     return out
+
+
+def _content_tokens(text: str) -> set[str]:
+    return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) >= 4 and t not in _TOKEN_STOP}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return float(len(a & b)) / float(max(1, len(a | b)))
+
+
+def _hybrid_pair_score(a: Dict[str, Any], b: Dict[str, Any]) -> tuple[float, float, str]:
+    """
+    Hybrid pair scoring:
+      - content similarity proxy (semantic-ish)
+      - lexical diversity boost (non-obvious bridges)
+      - source type balancing
+    Returns: (weight, bridge_score, rationale_seed_terms)
+    """
+    a_raw = str(a.get("raw_content") or "")
+    b_raw = str(b.get("raw_content") or "")
+    a_ctok = _content_tokens(a_raw)
+    b_ctok = _content_tokens(b_raw)
+
+    a_ttok = _cluster_tokens_from_tags(a.get("tags") or [])
+    b_ttok = _cluster_tokens_from_tags(b.get("tags") or [])
+
+    content_sim = _jaccard(a_ctok, b_ctok)
+    tag_sim = _jaccard(a_ttok, b_ttok)
+    base_weight = (0.7 * content_sim) + (0.3 * tag_sim)
+
+    st_a = str(a.get("source_type") or "").strip().lower()
+    st_b = str(b.get("source_type") or "").strip().lower()
+    source_bonus = 0.12 if st_a and st_b and st_a != st_b else 0.0
+    source_penalty = 0.05 if st_a and st_b and st_a == st_b else 0.0
+
+    # Encourage bridges that are semantically close but lexically not too obvious.
+    lexical_overlap = _jaccard(a_ctok, b_ctok)
+    lexical_diversity_boost = max(0.0, 0.16 - lexical_overlap)
+    bridge_score = max(0.0, base_weight + source_bonus + lexical_diversity_boost - source_penalty)
+
+    bridge_terms = ", ".join(sorted(list((a_ctok & b_ctok) or (a_ttok & b_ttok)))[:3])
+    return base_weight, bridge_score, bridge_terms
+
+
+def _build_tunnel_edges(fallback_tag: str, mems: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Build semantic-looking memory-to-memory links with rationale.
+    This is a first-pass heuristic scaffold; later phases can replace scoring with embeddings.
+    """
+    if len(mems) < 2:
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    working = mems[:_MAX_EDGE_NODES]
+    for a, b in combinations(working, 2):
+        a_id = str(a.get("id") or "").strip()
+        b_id = str(b.get("id") or "").strip()
+        if not a_id or not b_id:
+            continue
+
+        weight, bridge_score, bridge_terms = _hybrid_pair_score(a, b)
+        if bridge_score < _MIN_EDGE_CONFIDENCE:
+            continue
+
+        same_source = str(a.get("source_type") or "") == str(b.get("source_type") or "")
+        rationale = (
+            f"Linked through shared concepts ({bridge_terms or fallback_tag}) with complementary perspectives in '{fallback_tag}'."
+            if not same_source
+            else f"Linked through overlapping concepts ({bridge_terms or fallback_tag}) within the '{fallback_tag}' theme."
+        )
+        candidates.append(
+            {
+                "from_memory_id": a_id,
+                "to_memory_id": b_id,
+                "weight": round(weight, 4),
+                "bridge_score": round(bridge_score, 4),
+                "rationale": rationale,
+            }
+        )
+
+    candidates.sort(key=lambda x: (x.get("bridge_score") or 0.0, x.get("weight") or 0.0), reverse=True)
+    selected: List[Dict[str, Any]] = []
+    degree: Dict[str, int] = defaultdict(int)
+    for e in candidates:
+        a_id = str(e.get("from_memory_id") or "")
+        b_id = str(e.get("to_memory_id") or "")
+        if degree[a_id] >= _MAX_DEGREE_PER_NODE or degree[b_id] >= _MAX_DEGREE_PER_NODE:
+            continue
+        selected.append(e)
+        degree[a_id] += 1
+        degree[b_id] += 1
+        if len(selected) >= _MAX_EDGES_PER_TUNNEL:
+            break
+    return selected
 
 
 def form_tunnels(memory: MemoryManager, groq: Groq, *, user_id: int, openrouter_api_key: str) -> List[Dict[str, Any]]:
@@ -261,6 +364,14 @@ def form_tunnels(memory: MemoryManager, groq: Groq, *, user_id: int, openrouter_
             logger.exception("Failed to persist tunnel in Postgres: %s", tunnel_name)
             # Keep best-effort stamping on existing memory metadata.
 
+        # Persist graph edges (memory-to-memory links + rationale).
+        tunnel_edges = _build_tunnel_edges(tag, unique_mems)
+        if tunnel_edges:
+            try:
+                insert_tunnel_edges(tunnel_id=tunnel_id, user_id=user_id, edges=tunnel_edges)
+            except Exception:
+                logger.exception("Failed to persist tunnel edges for tunnel_id=%s", tunnel_id)
+
         # Stamp constituent memories with tunnel_id/tunnel_name in both stores.
         stamped = 0
         for m in unique_mems:
@@ -293,6 +404,7 @@ def form_tunnels(memory: MemoryManager, groq: Groq, *, user_id: int, openrouter_
             "tags": ["tunnel", tag],
             "user_id": user_id,
             "stamped_count": stamped,
+            "edge_count": len(tunnel_edges),
         }
         logger.info("Stamped %d/%d memories with tunnel_id=%s", stamped, len(unique_mems), tunnel_id)
         created_tunnels.append(tunnel_metadata)
@@ -317,10 +429,11 @@ def _name_tunnel_openrouter(openrouter_api_key: str, fallback_tag: str, snippets
             temperature=0.3,
             response_format={"type": "json_object"},
         )
-        raw = (resp.choices[0].message.content or "").strip()
-        import json as _json
-
-        obj = _json.loads(raw) if raw else {}
+        choices = getattr(resp, "choices", None) or []
+        first = choices[0] if choices else None
+        message = getattr(first, "message", None) if first else None
+        raw = str(getattr(message, "content", "") or "").strip()
+        obj = json.loads(raw) if raw else {}
         name = str(obj.get("name") or "").strip()
         reason = str(obj.get("reason") or "").strip()
         if not name:

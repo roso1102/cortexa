@@ -328,6 +328,20 @@ def create_api_blueprint(
             with _tunnel_lock:
                 _tunnel_runs_in_progress.discard(user_id)
 
+    @bp.get("/tunnels/<tunnel_id>/graph")
+    def get_tunnel_graph(tunnel_id: str) -> Any:
+        user_id = int(getattr(g, "user_id", 0) or 0)
+        if not user_id:
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            from src.db import fetch_tunnel_graph_for_user
+
+            payload = fetch_tunnel_graph_for_user(user_id=user_id, tunnel_id=tunnel_id)
+            return jsonify({"tunnel_id": tunnel_id, **payload})
+        except Exception as exc:
+            logger.exception("Failed to fetch tunnel graph user_id=%s tunnel_id=%s", user_id, tunnel_id)
+            return jsonify({"error": str(exc)}), 500
+
     @bp.get("/profile")
     def get_profile() -> Any:
         try:

@@ -154,6 +154,18 @@ tunnel_members = Table(
     Column("user_id", BigInteger, nullable=False, index=True),
 )
 
+tunnel_edges = Table(
+    "tunnel_edges",
+    _metadata,
+    Column("tunnel_id", String(128), ForeignKey("tunnels.id", ondelete="CASCADE"), primary_key=True),
+    Column("from_memory_id", String(128), ForeignKey("memories.memory_id", ondelete="CASCADE"), primary_key=True),
+    Column("to_memory_id", String(128), ForeignKey("memories.memory_id", ondelete="CASCADE"), primary_key=True),
+    Column("user_id", BigInteger, nullable=False, index=True),
+    Column("weight", Float, nullable=True),
+    Column("bridge_score", Float, nullable=True),
+    Column("rationale", Text, nullable=True),
+)
+
 
 # Existing deployments may have created `memories` before enrichment columns existed.
 # SQLAlchemy create_all() does not ALTER existing tables, so we add columns idempotently.
@@ -669,6 +681,37 @@ def update_memory_tunnel_fields(*, user_id: int, memory_id: str, tunnel_id: str,
         conn.execute(sql, {"tunnel_id": tunnel_id, "tunnel_name": tunnel_name, "user_id": user_id, "memory_id": memory_id})
 
 
+def insert_tunnel_edges(
+    *,
+    tunnel_id: str,
+    user_id: int,
+    edges: List[Dict[str, Any]],
+) -> None:
+    """
+    Persist tunnel graph edges with semantic rationale.
+    """
+    if not edges:
+        return
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(
+            tunnel_edges.insert(),
+            [
+                {
+                    "tunnel_id": tunnel_id,
+                    "from_memory_id": str(e.get("from_memory_id") or ""),
+                    "to_memory_id": str(e.get("to_memory_id") or ""),
+                    "user_id": user_id,
+                    "weight": e.get("weight"),
+                    "bridge_score": e.get("bridge_score"),
+                    "rationale": str(e.get("rationale") or "").strip() or None,
+                }
+                for e in edges
+                if str(e.get("from_memory_id") or "").strip() and str(e.get("to_memory_id") or "").strip()
+            ],
+        )
+
+
 def update_memory_last_resurfaced_ts(*, user_id: int, memory_id: str, last_resurfaced_ts: int) -> None:
     """Update last_resurfaced_ts for canonical memory rows."""
     engine = get_engine()
@@ -712,6 +755,77 @@ def fetch_tunnels_for_user(*, user_id: int, limit: int = 30) -> List[Dict[str, A
             }
         )
     return out
+
+
+def fetch_tunnel_graph_for_user(*, user_id: int, tunnel_id: str) -> Dict[str, Any]:
+    """
+    Fetch a tunnel graph payload with memory nodes and semantic edges.
+    """
+    engine = get_engine()
+    node_sql = sa_text(
+        """
+        SELECT
+          m.memory_id,
+          m.title,
+          m.raw_content_full,
+          m.tags,
+          m.created_at_ts
+        FROM tunnel_members tm
+        JOIN memories m ON m.memory_id = tm.memory_id
+        WHERE tm.user_id = :user_id
+          AND tm.tunnel_id = :tunnel_id
+        ORDER BY m.created_at_ts DESC
+        """
+    )
+    edge_sql = sa_text(
+        """
+        SELECT
+          from_memory_id,
+          to_memory_id,
+          weight,
+          bridge_score,
+          rationale
+        FROM tunnel_edges
+        WHERE user_id = :user_id
+          AND tunnel_id = :tunnel_id
+        ORDER BY bridge_score DESC NULLS LAST, weight DESC NULLS LAST
+        """
+    )
+    with engine.begin() as conn:
+        node_rows = conn.execute(node_sql, {"user_id": user_id, "tunnel_id": tunnel_id}).fetchall()
+        try:
+            edge_rows = conn.execute(edge_sql, {"user_id": user_id, "tunnel_id": tunnel_id}).fetchall()
+        except Exception:
+            # Backward compatibility when tunnel_edges migration has not been applied yet.
+            edge_rows = []
+
+    nodes: List[Dict[str, Any]] = []
+    for r in node_rows:
+        d = dict(r._mapping)
+        raw = str(d.get("raw_content_full") or "").strip()
+        nodes.append(
+            {
+                "id": d.get("memory_id"),
+                "title": d.get("title") or "",
+                "snippet": raw[:280],
+                "tags": d.get("tags") or [],
+                "created_at_ts": d.get("created_at_ts"),
+            }
+        )
+
+    edges: List[Dict[str, Any]] = []
+    for r in edge_rows:
+        d = dict(r._mapping)
+        edges.append(
+            {
+                "from_memory_id": d.get("from_memory_id"),
+                "to_memory_id": d.get("to_memory_id"),
+                "weight": d.get("weight"),
+                "bridge_score": d.get("bridge_score"),
+                "rationale": d.get("rationale") or "",
+            }
+        )
+    return {"nodes": nodes, "edges": edges}
 
 
 def find_memory_id_by_text_fingerprint(*, chat_id: int, text_fingerprint: str) -> str | None:
