@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from groq import Groq
+from openai import OpenAI
 
 from src.config import AppConfig
 from src.memory import MemoryManager
@@ -15,6 +16,87 @@ class ReflectionService:
     def __init__(self, config: AppConfig, memory: MemoryManager) -> None:
         self._memory = memory
         self._groq = Groq(api_key=config.groq_api_key)
+        self._openrouter_api_key = (config.openrouter_api_key or "").strip()
+        self._openrouter = (
+            OpenAI(
+                api_key=self._openrouter_api_key,
+                base_url="https://openrouter.ai/api/v1",
+            )
+            if self._openrouter_api_key
+            else None
+        )
+
+    def _topic_lines_summary(
+        self,
+        *,
+        todays_texts: List[str],
+        tag_counter: Counter,
+    ) -> str:
+        """
+        Build a personal, introspective summary with one concise line per topic.
+        OpenRouter first, Groq fallback, deterministic fallback last.
+        """
+        top_topics = [str(t) for t, _ in tag_counter.most_common(5) if str(t).strip()]
+        if not top_topics:
+            top_topics = ["today's main ideas"]
+        joined = "\n\n---\n\n".join(todays_texts[:18])
+        topic_block = ", ".join(top_topics)
+        prompt = (
+            "You are Exocortex, writing a personal end-of-day reflection for the user.\n"
+            "Write 3-6 bullet lines, each exactly ONE line, each line tied to a distinct topic.\n"
+            "Use second person (you/your), introspective tone, concise and specific.\n"
+            "No preamble, no title, no numbering.\n\n"
+            f"Top topics today: {topic_block}\n\n"
+            "Memories from today:\n"
+            f"{joined}\n\n"
+            "Output format strictly:\n"
+            "- <topic insight line>\n"
+            "- <topic insight line>\n"
+            "..."
+        )
+
+        # 1) OpenRouter first (better reflective style consistency for this task)
+        if self._openrouter is not None:
+            try:
+                chat = self._openrouter.chat.completions.create(
+                    model="minimax/minimax-01",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=420,
+                    temperature=0.45,
+                )
+                content = (chat.choices[0].message.content or "").strip()
+                if content:
+                    return content
+            except Exception:
+                pass
+
+        # 2) Groq fallback
+        try:
+            chat = self._groq.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=360,
+                temperature=0.35,
+            )
+            content = (chat.choices[0].message.content or "").strip()
+            if content:
+                return content
+        except Exception:
+            pass
+
+        # 3) Deterministic fallback: never return unavailable
+        lines: List[str] = []
+        for topic, _ in tag_counter.most_common(4):
+            t = str(topic).strip()
+            if not t:
+                continue
+            lines.append(f"- You kept coming back to {t}, and it looks like this is becoming part of your core thinking.")
+        if not lines:
+            lines = [
+                "- You captured meaningful ideas today; your notes show steady curiosity and momentum.",
+                "- You are building continuity in your thinking by turning scattered inputs into saved memory.",
+            ]
+        return "\n".join(lines)
 
     def summarize_today(self) -> str:
         """
@@ -77,27 +159,7 @@ class ReflectionService:
         if not todays_texts:
             return header
 
-        # --- LLM summary ---
-        joined = "\n\n---\n\n".join(todays_texts[:20])
-        prompt = (
-            "You are Exocortex, a personal cognitive assistant writing a daily reflection directly to the user.\n\n"
-            "Memories from today:\n"
-            f"{joined}\n\n"
-            "Write 3–5 concise bullet points summarizing what the user focused on today. "
-            "Address the user directly using 'you' and 'your' — never say 'the user' or 'they'. "
-            "Be specific, not generic. Example: 'You explored peanut allergy prevention...' not 'The user explored...'"
-        )
-
-        try:
-            chat = self._groq.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=400,
-                temperature=0.3,
-            )
-            llm_summary = chat.choices[0].message.content or "Unable to summarize."
-        except Exception:
-            llm_summary = "(LLM summary unavailable)"
+        llm_summary = self._topic_lines_summary(todays_texts=todays_texts, tag_counter=tag_counter)
 
         return f"{header}\n\n{llm_summary}"
 
@@ -174,27 +236,7 @@ class ReflectionService:
         if not todays_texts:
             return header
 
-        # --- LLM summary ---
-        joined = "\n\n---\n\n".join(todays_texts[:20])
-        prompt = (
-            "You are Exocortex, a personal cognitive assistant writing a daily reflection directly to the user.\n\n"
-            "Memories from today:\n"
-            f"{joined}\n\n"
-            "Write 3–5 concise bullet points summarizing what the user focused on today. "
-            "Address the user directly using 'you' and 'your' — never say 'the user' or 'they'. "
-            "Be specific, not generic. Example: 'You explored peanut allergy prevention...' not 'The user explored...'"
-        )
-
-        try:
-            chat = self._groq.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=400,
-                temperature=0.3,
-            )
-            llm_summary = chat.choices[0].message.content or "Unable to summarize."
-        except Exception:
-            llm_summary = "(LLM summary unavailable)"
+        llm_summary = self._topic_lines_summary(todays_texts=todays_texts, tag_counter=tag_counter)
 
         return f"{header}\n\n{llm_summary}"
 
