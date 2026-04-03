@@ -73,7 +73,7 @@ Set these on Koyeb (backend). Example stricter tunnels: `TUNNEL_MIN_MEMORIES=5`,
 | `POST` | `/api/tunnels/<tunnel_id>/edges/explain` | Body JSON `from_memory_id`, `to_memory_id`. Returns `summary`, `evidence` (quotes), `fallback`. |
 | `POST` | `/api/tunnels/<tunnel_id>/rebuild-edges` | Recomputes `tunnel_edges` from current tunnel members (same `X-Dashboard-Token` auth). |
 
-Embedding-first tunnels use ids like `tunnel_semantic_<ts>_<idx>` and `core_tag` `semantic`. If embedding fails or yields no clusters, formation falls back to tag-token clustering (legacy).
+Embedding-first tunnels use ids like `tunnel_semantic_<ts>_<idx>` and `core_tag` `semantic`. On each successful embedding-first run, **previous semantic tunnels for that user are deleted** (and memory `tunnel_id` stamps cleared for those tunnels) so “Generate Tunnels Now” does not stack duplicate “Semantic” cards. Tag-token tunnels (`learning`, etc.) are not removed. If embedding fails or yields no clusters, formation falls back to tag-token clustering (legacy) without deleting existing semantic tunnels.
 
 ## Dashboard (required for a sane graph)
 

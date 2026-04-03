@@ -27,6 +27,7 @@ from openai import OpenAI
 
 from src.memory import MemoryManager
 from src.db import (
+    delete_semantic_tunnels_for_user,
     fetch_main_memories_for_user_for_tunnels,
     insert_tunnel_and_members,
     insert_tunnel_edges,
@@ -81,12 +82,28 @@ def _tunnel_cluster_min_cosine() -> float:
 
 _SEMANTIC_CORE_TAG = "semantic"
 
+_GENERIC_TUNNEL_NAMES = frozenset(
+    {
+        "semantic",
+        "semantic theme",
+        "semantic cluster",
+        "semantic tunnels",
+        "latent theme",
+        "theme",
+        "untitled",
+        "untitled tunnel",
+    }
+)
+
 
 _TUNNEL_NAMER_PROMPT = """\
 You are Exocortex. Below are short memory snippets that belong to one latent theme in the user's mind.
 
 The connection may be non-obvious: infer a deeper thread (values, questions, projects, metaphors),
 not just a repeated keyword.
+
+Do NOT name the tunnel using only the word "Semantic" or generic labels like "Latent Theme".
+Pick a concrete, specific title grounded in what the snippets are about.
 
 Return ONLY valid JSON with keys:
 - name: short human-readable tunnel name (3-6 words, title-case)
@@ -95,6 +112,24 @@ Return ONLY valid JSON with keys:
 Snippets:
 {snippets}
 """
+
+
+def _sanitize_tunnel_name(name: str, snippets: List[str], cluster_index: int) -> str:
+    """Avoid duplicate generic titles when the LLM returns 'Semantic' etc."""
+    n = (name or "").strip()
+    low = n.lower()
+    if (
+        len(n) < 3
+        or low in _GENERIC_TUNNEL_NAMES
+        or low == "semantic"
+        or low.startswith("semantic ")
+    ):
+        seed = " ".join(snippets[:3])[:120]
+        words = re.findall(r"[A-Za-z]{4,}", seed)
+        if words:
+            return " ".join(words[:4]).title()
+        return f"Theme Group {cluster_index + 1}"
+    return n
 
 _MAX_TUNNELS = 8               # avoid tunnel explosion
 _SNIPPET_CHARS = 200           # max chars per snippet sent to LLM
@@ -401,6 +436,7 @@ def _create_single_tunnel(
     now_ts: int,
     now_iso: str,
     vec_by_id: Optional[Dict[str, List[float]]] = None,
+    cluster_index: int = 0,
 ) -> Dict[str, Any]:
     snippets_for_llm = []
     for m in unique_mems[:5]:
@@ -408,6 +444,7 @@ def _create_single_tunnel(
         snippets_for_llm.append(raw[:_SNIPPET_CHARS])
 
     tunnel_name, tunnel_reason = _name_tunnel_openrouter(openrouter_api_key, core_tag, snippets_for_llm)
+    tunnel_name = _sanitize_tunnel_name(tunnel_name, snippets_for_llm, cluster_index)
 
     try:
         insert_tunnel_and_members(
@@ -603,6 +640,11 @@ def form_tunnels(
             min_cos=min_cos,
         )
         if clusters:
+            try:
+                removed = delete_semantic_tunnels_for_user(user_id=user_id)
+                logger.info("Replaced semantic tunnels for user_id=%s removed=%s", user_id, removed)
+            except Exception:
+                logger.exception("delete_semantic_tunnels_for_user failed user_id=%s", user_id)
             logger.info("Embedding-first tunnels: %d cluster(s)", len(clusters))
             created: List[Dict[str, Any]] = []
             for idx, cluster in enumerate(clusters):
@@ -617,6 +659,7 @@ def form_tunnels(
                     now_ts=now_ts,
                     now_iso=now_iso,
                     vec_by_id=vec_by_id,
+                    cluster_index=idx,
                 )
                 created.append(meta)
             return created
@@ -667,7 +710,7 @@ def explain_tunnel_edge_openrouter(
     *,
     memory_a: Dict[str, Any],
     memory_b: Dict[str, Any],
-    excerpt_chars: int = 1800,
+    excerpt_chars: int = 4000,
 ) -> tuple[str, List[Dict[str, str]], bool]:
     """
     LLM explanation with evidence quotes. Returns (summary, evidence_list, fallback_used).

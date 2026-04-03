@@ -627,6 +627,52 @@ def fetch_main_memories_for_user_for_tunnels(
     return out
 
 
+def delete_semantic_tunnels_for_user(*, user_id: int) -> int:
+    """
+    Remove embedding-first tunnels for a user (core_tag semantic or id tunnel_semantic_*).
+    Cascades tunnel_members and tunnel_edges. Clears tunnel_id stamps on affected memories
+    so rows do not point at deleted tunnel ids.
+    Returns number of tunnels deleted (best-effort rowcount).
+    """
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(
+            sa_text(
+                """
+                UPDATE memories m
+                SET tunnel_id = NULL,
+                    tunnel_name = NULL
+                FROM tunnels t
+                WHERE m.user_id = :user_id
+                  AND m.tunnel_id = t.id
+                  AND t.user_id = :user_id
+                  AND (
+                    t.core_tag = 'semantic'
+                    OR t.id LIKE 'tunnel_semantic_%'
+                  )
+                """
+            ),
+            {"user_id": user_id},
+        )
+        res = conn.execute(
+            sa_text(
+                """
+                DELETE FROM tunnels
+                WHERE user_id = :user_id
+                  AND (
+                    core_tag = 'semantic'
+                    OR id LIKE 'tunnel_semantic_%'
+                  )
+                """
+            ),
+            {"user_id": user_id},
+        )
+        try:
+            return int(res.rowcount or 0)  # type: ignore[attr-defined]
+        except Exception:
+            return 0
+
+
 def insert_tunnel_and_members(
     *,
     tunnel_id: str,
